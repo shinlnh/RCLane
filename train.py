@@ -20,6 +20,7 @@ Examples:
 import os
 import time
 import argparse
+from contextlib import nullcontext
 
 import torch
 from torch.utils.data import DataLoader
@@ -75,7 +76,11 @@ def main():
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--lr", type=float, default=6e-4)
     ap.add_argument("--subset", type=int, default=None, help="cap #train samples")
-    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--prefetch", type=int, default=4,
+                    help="batches prefetched per worker when workers > 0")
+    ap.add_argument("--amp", action="store_true",
+                    help="use CUDA automatic mixed precision")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--cache-dir", default="./gt_cache_train")
     ap.add_argument("--out", default="./checkpoints")
@@ -84,17 +89,33 @@ def main():
 
     os.makedirs(args.out, exist_ok=True)
     device = torch.device(args.device)
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
     print(f"dataset={args.dataset} | device={device} | vision={args.vision} "
-          f"| subset={args.subset} | batch={args.batch} | epochs={args.epochs}")
+          f"| subset={args.subset} | batch={args.batch} | epochs={args.epochs} "
+          f"| workers={args.workers} | amp={args.amp and device.type == 'cuda'}")
 
     ds = build_dataset(args)
-    dl = DataLoader(ds, batch_size=args.batch, shuffle=True, num_workers=args.workers,
-                    collate_fn=collate, drop_last=True, pin_memory=(device.type == "cuda"))
+    loader_kwargs = dict(
+        batch_size=args.batch,
+        shuffle=True,
+        num_workers=args.workers,
+        collate_fn=collate,
+        drop_last=True,
+        pin_memory=(device.type == "cuda"),
+    )
+    if args.workers > 0:
+        loader_kwargs.update(persistent_workers=True, prefetch_factor=args.prefetch)
+    dl = DataLoader(ds, **loader_kwargs)
     print(f"train samples: {len(ds)} | batches/epoch: {len(dl)}")
+    if len(dl) == 0:
+        raise ValueError("No training batches. Reduce --batch or increase --subset/dataset size.")
 
     model = RCLane(vision=args.vision, img_size=(320, 800)).to(device)
     crit = RCLaneLoss()
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    use_amp = args.amp and device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     total_steps = args.epochs * len(dl)
     step = 0
@@ -102,26 +123,39 @@ def main():
     for epoch in range(args.epochs):
         running = {}
         t0 = time.time()
+        end = t0
         for it, (imgs, targets) in enumerate(dl):
-            imgs = imgs.to(device)
-            targets = {k: v.to(device) for k, v in targets.items()}
+            data_time = time.time() - end
+            imgs = imgs.to(device, non_blocking=True)
+            targets = {k: v.to(device, non_blocking=True) for k, v in targets.items()}
 
-            preds = model(imgs)
-            out = crit(preds, targets)
+            amp_ctx = torch.amp.autocast("cuda", enabled=use_amp) if use_amp else nullcontext()
+            with amp_ctx:
+                preds = model(imgs)
+                out = crit(preds, targets)
             loss = out["loss"]
 
-            optim.zero_grad()
-            loss.backward()
-            optim.step()
+            optim.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.step(optim)
+            scaler.update()
             lr = poly_lr(optim, args.lr, step, total_steps)
             step += 1
+            batch_time = time.time() - end
+            end = time.time()
 
             for k, v in out.items():
                 running[k] = running.get(k, 0.0) + v.item()
+            running["data_time"] = running.get("data_time", 0.0) + data_time
+            running["batch_time"] = running.get("batch_time", 0.0) + batch_time
             if (it + 1) % args.log_every == 0:
                 avg = running["loss"] / (it + 1)
+                avg_data = running["data_time"] / (it + 1)
+                avg_batch = running["batch_time"] / (it + 1)
+                ips = args.batch / max(avg_batch, 1e-9)
                 print(f"  e{epoch} [{it+1}/{len(dl)}] loss={loss.item():.3f} "
-                      f"(avg {avg:.3f}) lr={lr:.2e}")
+                      f"(avg {avg:.3f}) lr={lr:.2e} data={avg_data:.2f}s "
+                      f"step={avg_batch:.2f}s img/s={ips:.2f}")
 
         n = len(dl)
         msg = " | ".join(f"{k}={running[k]/n:.3f}" for k in
