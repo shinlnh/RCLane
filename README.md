@@ -35,6 +35,18 @@ relay-chain codec), `dataset.py` (base), and `train.py` (the training loop with 
   and verified end-to-end (an 8-image overfit drives the loss 42.5 → 7.2). Still to do:
   data augmentation, F1 evaluation, and a full GPU training run.
 
+## Datasets
+
+The network is dataset-agnostic; each branch trains against one of the datasets below.
+Download the one matching your target branch and point `--data-root` at its extracted
+folder.
+
+| Dataset | Used by | Download |
+|---|---|---|
+| **CULane** | `feat/train-RCLane-with-CULane` | [xingangpan.github.io/projects/CULane.html](https://xingangpan.github.io/projects/CULane.html) — official release (Google Drive, ~50 GB). Grab every `driver_*` archive **plus** `laneseg_label_w16.tar.gz` and `list.tar.gz`. |
+| **CurveLanes** | `feat/train-RCLane-with-CurveLanes` | [github.com/SoulmateB/CurveLanes](https://github.com/SoulmateB/CurveLanes) — official release. |
+| **CARLA** (custom) | `feat/train-RCLane-with-CARLA` | [huggingface.co/datasets/BanVienCorp/dataset_laneatt_fullmap](https://huggingface.co/datasets/BanVienCorp/dataset_laneatt_fullmap/tree/feat%2Fadd-dataset-laneatt-fulltown-clean) — CARLA-simulated lane data (`feat/add-dataset-laneatt-fulltown-clean` branch). |
+
 ## Getting started
 
 ```bash
