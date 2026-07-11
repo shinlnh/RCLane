@@ -23,13 +23,15 @@ import argparse
 import random
 from contextlib import nullcontext
 
+import cv2
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
 from rclane import RCLane
 from loss import RCLaneLoss
-from dataset import collate
+from dataset import collate, normalize_image
+from decode import decode_predictions
 
 # per-dataset default list file (relative to --data-root)
 _DEFAULT_LIST = {"culane": "list/train_gt.txt", "curvelanes": "train/train.txt"}
@@ -68,7 +70,8 @@ def _load_rng_state(state, device):
 
 
 def save_checkpoint(path, model, optim, scaler, args, epoch, step,
-                    best_loss, metrics, device, total_steps, monitor_name):
+                    best_score, metrics, device, total_steps, monitor_name,
+                    monitor_mode):
     state = {
         "model": model.state_dict(),
         "optim": optim.state_dict(),
@@ -77,8 +80,10 @@ def save_checkpoint(path, model, optim, scaler, args, epoch, step,
         "next_epoch": epoch + 1,
         "step": step,
         "total_steps": total_steps,
-        "best_loss": best_loss,
+        "best_loss": best_score,
+        "best_score": best_score,
         "monitor_name": monitor_name,
+        "monitor_mode": monitor_mode,
         "metrics": metrics,
         "args": vars(args),
         "rng_state": _rng_state(device),
@@ -98,8 +103,24 @@ def load_checkpoint(path, model, optim, scaler, device):
     _load_rng_state(ckpt.get("rng_state"), device)
     start_epoch = int(ckpt.get("next_epoch", ckpt.get("epoch", -1) + 1))
     step = int(ckpt.get("step", start_epoch))
-    best_loss = float(ckpt.get("best_loss", float("inf")))
-    return start_epoch, step, best_loss, ckpt
+    best_score = float(ckpt.get("best_score", ckpt.get("best_loss", float("inf"))))
+    return start_epoch, step, best_score, ckpt
+
+
+def monitor_spec(args, has_eval):
+    if args.eval_f1:
+        return "val_f1", "max"
+    if has_eval:
+        return "val_loss", "min"
+    return "loss", "min"
+
+
+def initial_best_score(mode):
+    return -float("inf") if mode == "max" else float("inf")
+
+
+def is_better(value, best, mode):
+    return value > best if mode == "max" else value < best
 
 
 def build_dataset(args):
@@ -176,6 +197,155 @@ def evaluate(model, crit, dl, device, use_amp):
     return metrics
 
 
+def _target_from_gt(gt):
+    return {
+        "seg_map": torch.from_numpy(gt["seg_map"]).long(),
+        "up_arrow": torch.from_numpy(gt["up_arrow"]).float(),
+        "down_arrow": torch.from_numpy(gt["down_arrow"]).float(),
+        "up_bound": torch.from_numpy(gt["up_bound"]).float(),
+        "down_bound": torch.from_numpy(gt["down_bound"]).float(),
+    }
+
+
+def _raster_lane(points, width, height, lane_width):
+    mask = np.zeros((height, width), np.uint8)
+    pts = np.asarray(points, dtype=np.float32)
+    if pts.ndim != 2 or len(pts) < 2:
+        return mask
+    pts[:, 0] = np.clip(pts[:, 0], 0, width - 1)
+    pts[:, 1] = np.clip(pts[:, 1], 0, height - 1)
+    cv2.polylines(mask, [pts.astype(np.int32)], False, 1, lane_width)
+    return mask
+
+
+def _lane_iou(pred_points, gt_points, width, height, lane_width):
+    pred_mask = _raster_lane(pred_points, width, height, lane_width)
+    gt_mask = _raster_lane(gt_points, width, height, lane_width)
+    union = int(np.logical_or(pred_mask, gt_mask).sum())
+    if union == 0:
+        return 0.0
+    inter = int(np.logical_and(pred_mask, gt_mask).sum())
+    return inter / float(union)
+
+
+def _match_count(pred_lanes, gt_lanes, width, height, iou_thr, lane_width):
+    if not pred_lanes or not gt_lanes:
+        return 0
+    graph = [[] for _ in pred_lanes]
+    for pi, pred in enumerate(pred_lanes):
+        for gi, gt in enumerate(gt_lanes):
+            if _lane_iou(pred, gt, width, height, lane_width) >= iou_thr:
+                graph[pi].append(gi)
+
+    match_gt = [-1] * len(gt_lanes)
+
+    def dfs(pi, seen):
+        for gi in graph[pi]:
+            if seen[gi]:
+                continue
+            seen[gi] = True
+            if match_gt[gi] == -1 or dfs(match_gt[gi], seen):
+                match_gt[gi] = pi
+                return True
+        return False
+
+    matched = 0
+    for pi in range(len(pred_lanes)):
+        if dfs(pi, [False] * len(gt_lanes)):
+            matched += 1
+    return matched
+
+
+def _scale_pred_lanes(decoded_lanes, ow, oh, model_w, model_h):
+    sx, sy = ow / model_w, oh / model_h
+    lanes = []
+    for lane in decoded_lanes:
+        xy = lane.xy()
+        if len(xy) < 2:
+            continue
+        xy[:, 0] *= sx
+        xy[:, 1] *= sy
+        lanes.append(xy)
+    return lanes
+
+
+def evaluate_f1(model, crit, ds, args, device, use_amp):
+    model.eval()
+    running = {}
+    tp = fp = fn = 0
+    batch = []
+    metas = []
+    t0 = time.time()
+
+    def flush():
+        nonlocal tp, fp, fn, batch, metas
+        if not batch:
+            return
+        imgs, targets = collate(batch)
+        imgs = imgs.to(device, non_blocking=True)
+        targets = {k: v.to(device, non_blocking=True) for k, v in targets.items()}
+        amp_ctx = torch.amp.autocast("cuda", enabled=use_amp) if use_amp else nullcontext()
+        with torch.no_grad(), amp_ctx:
+            preds = model(imgs)
+            out = crit(preds, targets)
+        for k, v in out.items():
+            running[k] = running.get(k, 0.0) + v.item()
+
+        decoded = decode_predictions(
+            preds,
+            seg_threshold=args.decode_seg_threshold,
+            seed_threshold=args.decode_seed_threshold,
+            seed_min_dist=args.decode_seed_min_dist,
+            score_thresh=args.decode_score_thresh,
+            iou_thresh=args.decode_nms_iou,
+        )
+        for lanes_pred, meta in zip(decoded, metas):
+            gt_lanes, ow, oh = meta
+            pred_lanes = _scale_pred_lanes(lanes_pred, ow, oh, ds.W, ds.H)
+            gt_lanes = [np.asarray(lane, dtype=np.float32) for lane in gt_lanes
+                        if len(lane) >= 2]
+            matches = _match_count(
+                pred_lanes, gt_lanes, ow, oh, args.f1_iou_thresh, args.f1_lane_width
+            )
+            tp += matches
+            fp += max(0, len(pred_lanes) - matches)
+            fn += max(0, len(gt_lanes) - matches)
+        batch = []
+        metas = []
+
+    with torch.no_grad():
+        for idx in range(len(ds)):
+            img_bgr, lanes_orig, ow, oh, key = ds._load(idx)
+            gt = ds._get_gt(key, lanes_orig, ow, oh)
+            x = normalize_image(img_bgr, ds.W, ds.H)
+            batch.append((x, _target_from_gt(gt)))
+            metas.append((lanes_orig, ow, oh))
+            if len(batch) >= (args.eval_batch or args.batch):
+                flush()
+        flush()
+
+    denom_p = tp + fp
+    denom_r = tp + fn
+    precision = tp / denom_p if denom_p else 0.0
+    recall = tp / denom_r if denom_r else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+    n = max(1, int(np.ceil(len(ds) / float(args.eval_batch or args.batch))))
+    metrics = {f"val_{k}": running[k] / n for k in
+               ["loss", "seg_pos", "seg_neg", "up_arrow", "down_arrow",
+                "up_bound", "down_bound"]}
+    metrics.update({
+        "val_precision": precision,
+        "val_recall": recall,
+        "val_f1": f1,
+        "val_tp": float(tp),
+        "val_fp": float(fp),
+        "val_fn": float(fn),
+        "val_time": time.time() - t0,
+    })
+    model.train()
+    return metrics
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", default="carla",
@@ -211,6 +381,15 @@ def main():
                     help="validation dataloader workers; defaults to --workers")
     ap.add_argument("--eval-every", type=int, default=1,
                     help="run validation every N epochs when --eval-list is set")
+    ap.add_argument("--eval-f1", action="store_true",
+                    help="compute CULane-style lane IoU F1 on the eval split")
+    ap.add_argument("--f1-iou-thresh", type=float, default=0.5)
+    ap.add_argument("--f1-lane-width", type=int, default=30)
+    ap.add_argument("--decode-seg-threshold", type=float, default=0.5)
+    ap.add_argument("--decode-seed-threshold", type=float, default=None)
+    ap.add_argument("--decode-seed-min-dist", type=int, default=2)
+    ap.add_argument("--decode-score-thresh", type=float, default=0.10)
+    ap.add_argument("--decode-nms-iou", type=float, default=0.5)
     ap.add_argument("--log-every", type=int, default=50)
     args = ap.parse_args()
 
@@ -238,6 +417,7 @@ def main():
     if len(dl) == 0:
         raise ValueError("No training batches. Reduce --batch or increase --subset/dataset size.")
     eval_dl = None
+    eval_ds = None
     if args.eval_list:
         eval_ds = build_dataset_split(
             dataset=args.dataset,
@@ -247,18 +427,22 @@ def main():
             cache_dir=args.cache_dir,
             max_samples=args.eval_subset,
         )
-        eval_dl = build_loader(
-            eval_ds,
-            args,
-            device,
-            shuffle=False,
-            drop_last=False,
-            workers=args.eval_workers if args.eval_workers is not None else args.workers,
-            batch_size=args.eval_batch or args.batch,
-        )
-        print(f"eval samples: {len(eval_ds)} | batches/eval: {len(eval_dl)}")
-        if len(eval_dl) == 0:
-            raise ValueError("No eval batches. Increase --eval-subset or reduce --eval-batch.")
+        if args.eval_f1:
+            eval_batches = int(np.ceil(len(eval_ds) / float(args.eval_batch or args.batch)))
+            print(f"eval samples: {len(eval_ds)} | batches/eval: {eval_batches} | f1=True")
+        else:
+            eval_dl = build_loader(
+                eval_ds,
+                args,
+                device,
+                shuffle=False,
+                drop_last=False,
+                workers=args.eval_workers if args.eval_workers is not None else args.workers,
+                batch_size=args.eval_batch or args.batch,
+            )
+            print(f"eval samples: {len(eval_ds)} | batches/eval: {len(eval_dl)}")
+            if len(eval_dl) == 0:
+                raise ValueError("No eval batches. Increase --eval-subset or reduce --eval-batch.")
 
     model = RCLane(vision=args.vision, img_size=(320, 800)).to(device)
     crit = RCLaneLoss()
@@ -279,15 +463,19 @@ def main():
         if ckpt.get("total_steps") != total_steps:
             print(f"warning: checkpoint total_steps={ckpt.get('total_steps')} "
                   f"but current total_steps={total_steps}")
-        current_monitor = "val_loss" if eval_dl is not None else "loss"
+        current_monitor, current_monitor_mode = monitor_spec(
+            args, eval_dl is not None or eval_ds is not None
+        )
         resume_monitor = ckpt.get(
             "monitor_name",
             "val_loss" if "val_loss" in ckpt.get("metrics", {}) else "loss",
         )
-        if resume_monitor != current_monitor:
-            print(f"warning: checkpoint monitor={resume_monitor} but current "
-                  f"monitor={current_monitor}; resetting best_loss")
-            best_loss = float("inf")
+        resume_monitor_mode = ckpt.get("monitor_mode", "min")
+        if resume_monitor != current_monitor or resume_monitor_mode != current_monitor_mode:
+            print(f"warning: checkpoint monitor={resume_monitor}/{resume_monitor_mode} "
+                  f"but current monitor={current_monitor}/{current_monitor_mode}; "
+                  "resetting best score")
+            best_loss = initial_best_score(current_monitor_mode)
 
     model.train()
     for epoch in range(start_epoch, args.epochs):
@@ -337,33 +525,43 @@ def main():
                          ["loss", "seg_pos", "seg_neg", "up_arrow", "down_arrow",
                           "up_bound", "down_bound"])
         print(f"epoch {epoch} done in {epoch_time:.1f}s :: {msg}")
-        if eval_dl is not None and (epoch + 1) % args.eval_every == 0:
-            eval_metrics = evaluate(model, crit, eval_dl, device, use_amp)
+        if (eval_dl is not None or eval_ds is not None) and (epoch + 1) % args.eval_every == 0:
+            if args.eval_f1:
+                eval_metrics = evaluate_f1(model, crit, eval_ds, args, device, use_amp)
+            else:
+                eval_metrics = evaluate(model, crit, eval_dl, device, use_amp)
             metrics.update(eval_metrics)
-            eval_msg = " | ".join(f"{k}={eval_metrics[k]:.3f}" for k in
-                                  ["val_loss", "val_seg_pos", "val_seg_neg",
-                                   "val_up_arrow", "val_down_arrow",
-                                   "val_up_bound", "val_down_bound"])
+            eval_keys = ["val_loss", "val_seg_pos", "val_seg_neg",
+                         "val_up_arrow", "val_down_arrow",
+                         "val_up_bound", "val_down_bound"]
+            if args.eval_f1:
+                eval_keys += ["val_precision", "val_recall", "val_f1"]
+            eval_msg = " | ".join(f"{k}={eval_metrics[k]:.3f}" for k in eval_keys)
             print(f"eval epoch {epoch} in {eval_metrics['val_time']:.1f}s :: {eval_msg}")
 
-        monitor = metrics.get("val_loss", metrics["loss"])
-        monitor_name = "val_loss" if "val_loss" in metrics else "loss"
-        is_best = monitor < best_loss
+        monitor_name, monitor_mode = monitor_spec(
+            args, "val_loss" in metrics or "val_f1" in metrics
+        )
+        monitor = metrics.get(monitor_name, metrics["loss"])
+        is_best = is_better(monitor, best_loss, monitor_mode)
         if is_best:
             best_loss = monitor
 
         ckpt = os.path.join(args.out, f"rclane_{args.vision}_e{epoch}.pth")
         save_checkpoint(ckpt, model, optim, scaler, args, epoch, step,
-                        best_loss, metrics, device, total_steps, monitor_name)
+                        best_loss, metrics, device, total_steps, monitor_name,
+                        monitor_mode)
         print(f"saved {ckpt}")
         last_ckpt = os.path.join(args.out, "last.pth")
         save_checkpoint(last_ckpt, model, optim, scaler, args, epoch, step,
-                        best_loss, metrics, device, total_steps, monitor_name)
+                        best_loss, metrics, device, total_steps, monitor_name,
+                        monitor_mode)
         print(f"saved {last_ckpt}")
         if is_best:
             best_ckpt = os.path.join(args.out, "best.pth")
             save_checkpoint(best_ckpt, model, optim, scaler, args, epoch, step,
-                            best_loss, metrics, device, total_steps, monitor_name)
+                            best_loss, metrics, device, total_steps, monitor_name,
+                            monitor_mode)
             print(f"saved {best_ckpt} (best {monitor_name} {best_loss:.3f})")
 
     print("training done.")
