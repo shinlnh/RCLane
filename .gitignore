@@ -1,0 +1,28 @@
+# datasets / data
+data/
+*.zip
+*.jpg
+*.png
+
+# generated GT cache
+gt_cache*/
+
+# checkpoints / weights
+checkpoints/
+*.pth
+*.pt
+*.onnx
+*.ckpt
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# envs / editors
+.venv/
+venv/
+.vscode/
+.idea/
+.DS_Store
