@@ -36,7 +36,8 @@ _DEFAULT_LIST = {"culane": "list/train_gt.txt", "curvelanes": "train/train.txt"}
 
 
 def poly_lr(optimizer, base_lr, step, total_steps, power=0.9):
-    lr = base_lr * (1 - step / max(1, total_steps)) ** power
+    progress = min(step / max(1, total_steps), 1.0)
+    lr = base_lr * (1 - progress) ** power
     for pg in optimizer.param_groups:
         pg["lr"] = lr
     return lr
@@ -67,7 +68,7 @@ def _load_rng_state(state, device):
 
 
 def save_checkpoint(path, model, optim, scaler, args, epoch, step,
-                    best_loss, metrics, device, total_steps):
+                    best_loss, metrics, device, total_steps, monitor_name):
     state = {
         "model": model.state_dict(),
         "optim": optim.state_dict(),
@@ -77,6 +78,7 @@ def save_checkpoint(path, model, optim, scaler, args, epoch, step,
         "step": step,
         "total_steps": total_steps,
         "best_loss": best_loss,
+        "monitor_name": monitor_name,
         "metrics": metrics,
         "args": vars(args),
         "rng_state": _rng_state(device),
@@ -102,23 +104,76 @@ def load_checkpoint(path, model, optim, scaler, device):
 
 def build_dataset(args):
     """Lazily import and build the selected dataset."""
-    if args.dataset == "carla":
+    return build_dataset_split(
+        dataset=args.dataset,
+        data_root=args.data_root,
+        label=args.label,
+        list_file=args.train_list or _DEFAULT_LIST.get(args.dataset),
+        cache_dir=args.cache_dir,
+        max_samples=args.subset,
+    )
+
+
+def build_dataset_split(dataset, data_root, label=None, list_file=None,
+                        cache_dir=None, max_samples=None):
+    """Build a dataset split. `list_file` is relative to data_root."""
+    if dataset == "carla":
         from dataset_carla import CarlaLaneDataset
         return CarlaLaneDataset(
-            label_json=os.path.join(args.data_root, args.label),
-            data_root=args.data_root,
-            cache_dir=args.cache_dir,
-            max_samples=args.subset,
+            label_json=os.path.join(data_root, label),
+            data_root=data_root,
+            cache_dir=cache_dir,
+            max_samples=max_samples,
         )
-    list_file = os.path.join(args.data_root, args.train_list or _DEFAULT_LIST[args.dataset])
-    if args.dataset == "culane":
+    if not list_file:
+        raise ValueError(f"{dataset} requires a list file")
+    split_file = os.path.join(data_root, list_file)
+    if dataset == "culane":
         from dataset_culane import CULaneDataset
         cls = CULaneDataset
     else:  # curvelanes
         from dataset_curvelanes import CurveLanesDataset
         cls = CurveLanesDataset
-    return cls(list_file=list_file, data_root=args.data_root,
-               cache_dir=args.cache_dir, max_samples=args.subset)
+    return cls(list_file=split_file, data_root=data_root,
+               cache_dir=cache_dir, max_samples=max_samples)
+
+
+def build_loader(ds, args, device, shuffle, drop_last, workers=None, batch_size=None):
+    workers = args.workers if workers is None else workers
+    batch_size = args.batch if batch_size is None else batch_size
+    loader_kwargs = dict(
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=workers,
+        collate_fn=collate,
+        drop_last=drop_last,
+        pin_memory=(device.type == "cuda"),
+    )
+    if workers > 0:
+        loader_kwargs.update(persistent_workers=True, prefetch_factor=args.prefetch)
+    return DataLoader(ds, **loader_kwargs)
+
+
+def evaluate(model, crit, dl, device, use_amp):
+    model.eval()
+    running = {}
+    t0 = time.time()
+    with torch.no_grad():
+        for imgs, targets in dl:
+            imgs = imgs.to(device, non_blocking=True)
+            targets = {k: v.to(device, non_blocking=True) for k, v in targets.items()}
+            amp_ctx = torch.amp.autocast("cuda", enabled=use_amp) if use_amp else nullcontext()
+            with amp_ctx:
+                out = crit(model(imgs), targets)
+            for k, v in out.items():
+                running[k] = running.get(k, 0.0) + v.item()
+    model.train()
+    n = len(dl)
+    metrics = {f"val_{k}": running[k] / n for k in
+               ["loss", "seg_pos", "seg_neg", "up_arrow", "down_arrow",
+                "up_bound", "down_bound"]}
+    metrics["val_time"] = time.time() - t0
+    return metrics
 
 
 def main():
@@ -146,6 +201,16 @@ def main():
     ap.add_argument("--out", default="./checkpoints")
     ap.add_argument("--resume", default=None,
                     help="checkpoint path to resume from, e.g. checkpoints/last.pth")
+    ap.add_argument("--eval-list", default=None,
+                    help="optional validation list file, relative to data-root")
+    ap.add_argument("--eval-subset", type=int, default=None,
+                    help="cap #validation samples")
+    ap.add_argument("--eval-batch", type=int, default=None,
+                    help="validation batch size; defaults to --batch")
+    ap.add_argument("--eval-workers", type=int, default=None,
+                    help="validation dataloader workers; defaults to --workers")
+    ap.add_argument("--eval-every", type=int, default=1,
+                    help="run validation every N epochs when --eval-list is set")
     ap.add_argument("--log-every", type=int, default=50)
     args = ap.parse_args()
 
@@ -172,6 +237,28 @@ def main():
     print(f"train samples: {len(ds)} | batches/epoch: {len(dl)}")
     if len(dl) == 0:
         raise ValueError("No training batches. Reduce --batch or increase --subset/dataset size.")
+    eval_dl = None
+    if args.eval_list:
+        eval_ds = build_dataset_split(
+            dataset=args.dataset,
+            data_root=args.data_root,
+            label=args.label,
+            list_file=args.eval_list,
+            cache_dir=args.cache_dir,
+            max_samples=args.eval_subset,
+        )
+        eval_dl = build_loader(
+            eval_ds,
+            args,
+            device,
+            shuffle=False,
+            drop_last=False,
+            workers=args.eval_workers if args.eval_workers is not None else args.workers,
+            batch_size=args.eval_batch or args.batch,
+        )
+        print(f"eval samples: {len(eval_ds)} | batches/eval: {len(eval_dl)}")
+        if len(eval_dl) == 0:
+            raise ValueError("No eval batches. Increase --eval-subset or reduce --eval-batch.")
 
     model = RCLane(vision=args.vision, img_size=(320, 800)).to(device)
     crit = RCLaneLoss()
@@ -192,6 +279,15 @@ def main():
         if ckpt.get("total_steps") != total_steps:
             print(f"warning: checkpoint total_steps={ckpt.get('total_steps')} "
                   f"but current total_steps={total_steps}")
+        current_monitor = "val_loss" if eval_dl is not None else "loss"
+        resume_monitor = ckpt.get(
+            "monitor_name",
+            "val_loss" if "val_loss" in ckpt.get("metrics", {}) else "loss",
+        )
+        if resume_monitor != current_monitor:
+            print(f"warning: checkpoint monitor={resume_monitor} but current "
+                  f"monitor={current_monitor}; resetting best_loss")
+            best_loss = float("inf")
 
     model.train()
     for epoch in range(start_epoch, args.epochs):
@@ -241,24 +337,34 @@ def main():
                          ["loss", "seg_pos", "seg_neg", "up_arrow", "down_arrow",
                           "up_bound", "down_bound"])
         print(f"epoch {epoch} done in {epoch_time:.1f}s :: {msg}")
+        if eval_dl is not None and (epoch + 1) % args.eval_every == 0:
+            eval_metrics = evaluate(model, crit, eval_dl, device, use_amp)
+            metrics.update(eval_metrics)
+            eval_msg = " | ".join(f"{k}={eval_metrics[k]:.3f}" for k in
+                                  ["val_loss", "val_seg_pos", "val_seg_neg",
+                                   "val_up_arrow", "val_down_arrow",
+                                   "val_up_bound", "val_down_bound"])
+            print(f"eval epoch {epoch} in {eval_metrics['val_time']:.1f}s :: {eval_msg}")
 
-        is_best = metrics["loss"] < best_loss
+        monitor = metrics.get("val_loss", metrics["loss"])
+        monitor_name = "val_loss" if "val_loss" in metrics else "loss"
+        is_best = monitor < best_loss
         if is_best:
-            best_loss = metrics["loss"]
+            best_loss = monitor
 
         ckpt = os.path.join(args.out, f"rclane_{args.vision}_e{epoch}.pth")
         save_checkpoint(ckpt, model, optim, scaler, args, epoch, step,
-                        best_loss, metrics, device, total_steps)
+                        best_loss, metrics, device, total_steps, monitor_name)
         print(f"saved {ckpt}")
         last_ckpt = os.path.join(args.out, "last.pth")
         save_checkpoint(last_ckpt, model, optim, scaler, args, epoch, step,
-                        best_loss, metrics, device, total_steps)
+                        best_loss, metrics, device, total_steps, monitor_name)
         print(f"saved {last_ckpt}")
         if is_best:
             best_ckpt = os.path.join(args.out, "best.pth")
             save_checkpoint(best_ckpt, model, optim, scaler, args, epoch, step,
-                            best_loss, metrics, device, total_steps)
-            print(f"saved {best_ckpt} (best train loss {best_loss:.3f})")
+                            best_loss, metrics, device, total_steps, monitor_name)
+            print(f"saved {best_ckpt} (best {monitor_name} {best_loss:.3f})")
 
     print("training done.")
 
