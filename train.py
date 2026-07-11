@@ -20,8 +20,10 @@ Examples:
 import os
 import time
 import argparse
+import random
 from contextlib import nullcontext
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
@@ -38,6 +40,64 @@ def poly_lr(optimizer, base_lr, step, total_steps, power=0.9):
     for pg in optimizer.param_groups:
         pg["lr"] = lr
     return lr
+
+
+def _rng_state(device):
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+    }
+    if device.type == "cuda":
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _load_rng_state(state, device):
+    if not state:
+        return
+    if "python" in state:
+        random.setstate(state["python"])
+    if "numpy" in state:
+        np.random.set_state(state["numpy"])
+    if "torch" in state:
+        torch.set_rng_state(state["torch"].cpu())
+    if device.type == "cuda" and "cuda" in state:
+        torch.cuda.set_rng_state_all([s.cpu() for s in state["cuda"]])
+
+
+def save_checkpoint(path, model, optim, scaler, args, epoch, step,
+                    best_loss, metrics, device, total_steps):
+    state = {
+        "model": model.state_dict(),
+        "optim": optim.state_dict(),
+        "scaler": scaler.state_dict(),
+        "epoch": epoch,
+        "next_epoch": epoch + 1,
+        "step": step,
+        "total_steps": total_steps,
+        "best_loss": best_loss,
+        "metrics": metrics,
+        "args": vars(args),
+        "rng_state": _rng_state(device),
+    }
+    tmp = path + ".tmp"
+    torch.save(state, tmp)
+    os.replace(tmp, path)
+
+
+def load_checkpoint(path, model, optim, scaler, device):
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    model.load_state_dict(ckpt["model"])
+    if "optim" in ckpt:
+        optim.load_state_dict(ckpt["optim"])
+    if "scaler" in ckpt:
+        scaler.load_state_dict(ckpt["scaler"])
+    _load_rng_state(ckpt.get("rng_state"), device)
+    start_epoch = int(ckpt.get("next_epoch", ckpt.get("epoch", -1) + 1))
+    step = int(ckpt.get("step", start_epoch))
+    best_loss = float(ckpt.get("best_loss", float("inf")))
+    return start_epoch, step, best_loss, ckpt
 
 
 def build_dataset(args):
@@ -84,6 +144,8 @@ def main():
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--cache-dir", default="./gt_cache_train")
     ap.add_argument("--out", default="./checkpoints")
+    ap.add_argument("--resume", default=None,
+                    help="checkpoint path to resume from, e.g. checkpoints/last.pth")
     ap.add_argument("--log-every", type=int, default=50)
     args = ap.parse_args()
 
@@ -119,8 +181,20 @@ def main():
 
     total_steps = args.epochs * len(dl)
     step = 0
+    start_epoch = 0
+    best_loss = float("inf")
+    if args.resume:
+        start_epoch, step, best_loss, ckpt = load_checkpoint(
+            args.resume, model, optim, scaler, device
+        )
+        print(f"resumed {args.resume} | start_epoch={start_epoch} "
+              f"| step={step} | best_loss={best_loss:.3f}")
+        if ckpt.get("total_steps") != total_steps:
+            print(f"warning: checkpoint total_steps={ckpt.get('total_steps')} "
+                  f"but current total_steps={total_steps}")
+
     model.train()
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         running = {}
         t0 = time.time()
         end = t0
@@ -158,14 +232,33 @@ def main():
                       f"step={avg_batch:.2f}s img/s={ips:.2f}")
 
         n = len(dl)
-        msg = " | ".join(f"{k}={running[k]/n:.3f}" for k in
+        metrics = {k: running[k] / n for k in
+                   ["loss", "seg_pos", "seg_neg", "up_arrow", "down_arrow",
+                    "up_bound", "down_bound"]}
+        epoch_time = time.time() - t0
+        metrics["epoch_time"] = epoch_time
+        msg = " | ".join(f"{k}={metrics[k]:.3f}" for k in
                          ["loss", "seg_pos", "seg_neg", "up_arrow", "down_arrow",
                           "up_bound", "down_bound"])
-        print(f"epoch {epoch} done in {time.time()-t0:.1f}s :: {msg}")
+        print(f"epoch {epoch} done in {epoch_time:.1f}s :: {msg}")
+
+        is_best = metrics["loss"] < best_loss
+        if is_best:
+            best_loss = metrics["loss"]
 
         ckpt = os.path.join(args.out, f"rclane_{args.vision}_e{epoch}.pth")
-        torch.save({"model": model.state_dict(), "epoch": epoch, "args": vars(args)}, ckpt)
+        save_checkpoint(ckpt, model, optim, scaler, args, epoch, step,
+                        best_loss, metrics, device, total_steps)
         print(f"saved {ckpt}")
+        last_ckpt = os.path.join(args.out, "last.pth")
+        save_checkpoint(last_ckpt, model, optim, scaler, args, epoch, step,
+                        best_loss, metrics, device, total_steps)
+        print(f"saved {last_ckpt}")
+        if is_best:
+            best_ckpt = os.path.join(args.out, "best.pth")
+            save_checkpoint(best_ckpt, model, optim, scaler, args, epoch, step,
+                            best_loss, metrics, device, total_steps)
+            print(f"saved {best_ckpt} (best train loss {best_loss:.3f})")
 
     print("training done.")
 
