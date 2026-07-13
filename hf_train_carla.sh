@@ -40,6 +40,7 @@ EVAL_WORKERS="${EVAL_WORKERS:-4}" # per GPU
 EVAL_DECODE_WORKERS="${EVAL_DECODE_WORKERS:-18}"
 CKPT_REPO="${CKPT_REPO:-BanVienCorp/LaneATT-Carla-checkpoints}"
 CKPT_SUBDIR="${CKPT_SUBDIR:-carla-${VISION}}"
+CACHE_BUCKET="${CACHE_BUCKET:-huyluongngoc/rclane-gt-cache}"
 EVAL_EVERY="${EVAL_EVERY:-1}"
 EVAL_SUBSET="${EVAL_SUBSET:---eval-subset 500}"
 # Resume a previous run in a NEW job: the container is fresh, so first pull last.pth
@@ -111,6 +112,7 @@ EOF
 hf jobs run \
     --flavor "${FLAVOR}" \
     --timeout "${TIMEOUT}" \
+    --volume "hf://buckets/${CACHE_BUCKET}:/workspace/gt_cache:rw" \
     --secrets HF_TOKEN \
     --env PYTHONUNBUFFERED=1 \
     --detach \
