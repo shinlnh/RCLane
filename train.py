@@ -261,34 +261,53 @@ def _target_from_gt(gt):
     }
 
 
-def _raster_lane(points, width, height, lane_width):
-    mask = np.zeros((height, width), np.uint8)
-    pts = np.asarray(points, dtype=np.float32)
-    if pts.ndim != 2 or len(pts) < 2:
-        return mask
-    pts[:, 0] = np.clip(pts[:, 0], 0, width - 1)
-    pts[:, 1] = np.clip(pts[:, 1], 0, height - 1)
-    cv2.polylines(mask, [pts.astype(np.int32)], False, 1, lane_width)
-    return mask
+def _rasterize_lanes(lanes, width, height, lane_width):
+    """Rasterize each lane once into a boolean mask; return masks + their areas.
+
+    Done once per lane (P + G rasterizations), not once per pred/gt pair, and on a
+    downscaled canvas -- lane-IoU is a ratio, so scaling pred and gt (and the line
+    width) by the same factor leaves it essentially unchanged while cutting the
+    pixel count quadratically. This is the hot path of F1 eval; on an untrained
+    model `decode` emits many spurious lanes, so P*G full-res mask ops dominate.
+    """
+    masks, areas = [], []
+    for pts in lanes:
+        mask = np.zeros((height, width), np.uint8)
+        p = np.asarray(pts, dtype=np.float32)
+        if p.ndim == 2 and len(p) >= 2:
+            p[:, 0] = np.clip(p[:, 0], 0, width - 1)
+            p[:, 1] = np.clip(p[:, 1], 0, height - 1)
+            cv2.polylines(mask, [p.astype(np.int32)], False, 1, lane_width)
+        m = mask.astype(bool)
+        masks.append(m)
+        areas.append(int(m.sum()))
+    return masks, areas
 
 
-def _lane_iou(pred_points, gt_points, width, height, lane_width):
-    pred_mask = _raster_lane(pred_points, width, height, lane_width)
-    gt_mask = _raster_lane(gt_points, width, height, lane_width)
-    union = int(np.logical_or(pred_mask, gt_mask).sum())
-    if union == 0:
-        return 0.0
-    inter = int(np.logical_and(pred_mask, gt_mask).sum())
-    return inter / float(union)
-
-
-def _match_count(pred_lanes, gt_lanes, width, height, iou_thr, lane_width):
+def _match_count(pred_lanes, gt_lanes, width, height, iou_thr, lane_width,
+                 scale=0.25):
     if not pred_lanes or not gt_lanes:
         return 0
+    w = max(1, int(round(width * scale)))
+    h = max(1, int(round(height * scale)))
+    lw = max(1, int(round(lane_width * scale)))
+    pred_s = [np.asarray(l, dtype=np.float32) * scale for l in pred_lanes]
+    gt_s = [np.asarray(l, dtype=np.float32) * scale for l in gt_lanes]
+    pred_masks, pred_area = _rasterize_lanes(pred_s, w, h, lw)
+    gt_masks, gt_area = _rasterize_lanes(gt_s, w, h, lw)
+
     graph = [[] for _ in pred_lanes]
-    for pi, pred in enumerate(pred_lanes):
-        for gi, gt in enumerate(gt_lanes):
-            if _lane_iou(pred, gt, width, height, lane_width) >= iou_thr:
+    for pi in range(len(pred_lanes)):
+        if pred_area[pi] == 0:
+            continue
+        for gi in range(len(gt_lanes)):
+            if gt_area[gi] == 0:
+                continue
+            inter = int(np.count_nonzero(pred_masks[pi] & gt_masks[gi]))
+            if inter == 0:
+                continue
+            union = pred_area[pi] + gt_area[gi] - inter
+            if union > 0 and inter / union >= iou_thr:
                 graph[pi].append(gi)
 
     match_gt = [-1] * len(gt_lanes)
@@ -359,7 +378,8 @@ def evaluate_f1(model, crit, ds, args, device, use_amp):
             gt_lanes = [np.asarray(lane, dtype=np.float32) for lane in gt_lanes
                         if len(lane) >= 2]
             matches = _match_count(
-                pred_lanes, gt_lanes, ow, oh, args.f1_iou_thresh, args.f1_lane_width
+                pred_lanes, gt_lanes, ow, oh, args.f1_iou_thresh,
+                args.f1_lane_width, scale=args.f1_eval_scale
             )
             tp += matches
             fp += max(0, len(pred_lanes) - matches)
@@ -445,6 +465,9 @@ def main():
                     help="compute CULane-style lane IoU F1 on the eval split")
     ap.add_argument("--f1-iou-thresh", type=float, default=0.5)
     ap.add_argument("--f1-lane-width", type=int, default=30)
+    ap.add_argument("--f1-eval-scale", type=float, default=0.25,
+                    help="downscale factor for the F1 IoU raster canvas "
+                         "(0.25 = 16x fewer pixels, ~14x faster; 1.0 = full res)")
     ap.add_argument("--decode-seg-threshold", type=float, default=0.5)
     ap.add_argument("--decode-seed-threshold", type=float, default=None)
     ap.add_argument("--decode-seed-min-dist", type=int, default=2)
