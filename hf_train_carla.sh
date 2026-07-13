@@ -7,8 +7,8 @@
 #   2. pull the training code from the HF Space repo (BanVienCorp/RCLane_2D_Detection)
 #   3. download the dataset zip from the HF dataset repo (feat branch revision)
 #   4. extract it  -> data_root = <extract>/data/dataset  (verified layout)
-#   5. train.py --dataset carla, with F1 validation on label_val.json and
-#      per-epoch checkpoint upload to the model repo (--push-to)
+#   5. torchrun launches one DDP rank per H200; 42 DataLoader processes warm/feed
+#      the GPUs and distributed F1 overlaps 8 loader + 36 decode processes
 #
 # The training loop itself uploads each epoch's checkpoint (best/last/e<N>) to the
 # model repo as it goes, so if the job is interrupted you keep every finished epoch
@@ -25,30 +25,44 @@
 set -uo pipefail
 
 # ---- knobs you may want to tweak -------------------------------------------
-FLAVOR="l4x1"          # GPU: l4x1 (L4 24GB, cheap) | a10g-large | a100-large ...
-TIMEOUT="12h"          # hard cap on job runtime
-IMAGE="pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime"
-CODE_SPACE="BanVienCorp/RCLane_2D_Detection"   # HF Space holding the training code
-VISION="b0"            # RCLane-S; b1/b2 for bigger
-EPOCHS=20
-BATCH=32
-WORKERS=4              # if you hit a DataLoader "bus error", drop to 0 or 2
-CKPT_REPO="BanVienCorp/LaneATT-Carla-checkpoints"
-CKPT_SUBDIR="carla-${VISION}"   # folder inside the model repo
-EVAL_EVERY=1           # run F1 validation every N epochs
-EVAL_SUBSET="--eval-subset 500"  # cap val images per eval for speed; "" = full val set
+FLAVOR="${FLAVOR:-h200x2}"        # 2x H200 141GB, 46 vCPU, 512GB RAM
+TIMEOUT="${TIMEOUT:-12h}"         # hard cap on job runtime
+IMAGE="${IMAGE:-pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime}"
+CODE_SPACE="${CODE_SPACE:-BanVienCorp/RCLane_2D_Detection}"
+VISION="${VISION:-b0}"            # RCLane-S; b1/b2 for bigger
+EPOCHS="${EPOCHS:-20}"
+BATCH="${BATCH:-64}"              # per GPU; DDP global batch = 128
+LR="${LR:-2.4e-3}"                # linear scaling from 6e-4 at global batch 32
+WORKERS="${WORKERS:-21}"          # per GPU: 42 loaders + 2 ranks; 2 vCPU for NCCL/OS
+PREFETCH="${PREFETCH:-1}"         # dense targets are large; one queued batch/worker
+EVAL_BATCH="${EVAL_BATCH:-64}"    # per GPU
+EVAL_WORKERS="${EVAL_WORKERS:-4}" # per GPU
+EVAL_DECODE_WORKERS="${EVAL_DECODE_WORKERS:-18}"
+CKPT_REPO="${CKPT_REPO:-BanVienCorp/LaneATT-Carla-checkpoints}"
+CKPT_SUBDIR="${CKPT_SUBDIR:-carla-${VISION}}"
+EVAL_EVERY="${EVAL_EVERY:-1}"
+EVAL_SUBSET="${EVAL_SUBSET:---eval-subset 500}"
 # Resume a previous run in a NEW job: the container is fresh, so first pull last.pth
 # from the model repo, then point --resume at it. Set RESUME_FROM_HUB=1 to do that.
-RESUME_FROM_HUB=0
-RESUME=""
+RESUME_FROM_HUB="${RESUME_FROM_HUB:-0}"
+RESUME="${RESUME:-}"
 # For a quick pipeline smoke test first, set: SUBSET="--subset 64" and EPOCHS=1
-SUBSET=""
+SUBSET="${SUBSET:-}"
 # ----------------------------------------------------------------------------
 
 JOB_SCRIPT=$(cat <<EOF
 set -eux
 
-pip install -q shapely opencv-python-headless "huggingface_hub[cli]"
+# Process-level parallelism owns the 46 vCPUs. Prevent OpenCV/BLAS from creating
+# nested thread teams inside each of the 42 loader / 36 F1 decoder processes.
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+pip install -q shapely opencv-python-headless huggingface_hub
 
 # 1) training code -- pull the HF Space repo (private -> uses HF_TOKEN from env)
 hf download ${CODE_SPACE} --repo-type space --local-dir /workspace/code
@@ -75,14 +89,18 @@ else
     RESUME_ARG="${RESUME}"
 fi
 
-# 4) train (data_root MUST point at data/dataset). train.py uploads each epoch's
-#    checkpoint to the model repo itself via --push-to, so nothing is lost mid-run.
-python train.py --dataset carla \
+# 4) DDP train on both H200s. The cold GT cache is built first with one sample per
+#    worker task, then reused by every epoch. Checkpoints upload after every epoch.
+torchrun --standalone --nproc_per_node=2 train.py --dataset carla \
     --data-root /workspace/ds/data/dataset \
     --label label_train.json \
     --eval-list label_val.json --eval-f1 --eval-every ${EVAL_EVERY} ${EVAL_SUBSET} \
-    --vision ${VISION} --epochs ${EPOCHS} --batch ${BATCH} \
-    --workers ${WORKERS} --amp --device cuda \
+    --eval-batch ${EVAL_BATCH} --eval-workers ${EVAL_WORKERS} \
+    --eval-decode-workers ${EVAL_DECODE_WORKERS} \
+    --vision ${VISION} --epochs ${EPOCHS} --batch ${BATCH} --lr ${LR} \
+    --workers ${WORKERS} --prefetch ${PREFETCH} --warm-cache \
+    --amp --amp-dtype bfloat16 --device cuda \
+    --cache-dir /workspace/gt_cache \
     --out /workspace/ckpt \
     --push-to ${CKPT_REPO} --push-subdir ${CKPT_SUBDIR} \
     \${RESUME_ARG} ${SUBSET}
@@ -95,6 +113,7 @@ hf jobs run \
     --flavor "${FLAVOR}" \
     --timeout "${TIMEOUT}" \
     --secrets HF_TOKEN \
+    --env PYTHONUNBUFFERED=1 \
     --detach \
     "${IMAGE}" \
     bash -c "${JOB_SCRIPT}"
