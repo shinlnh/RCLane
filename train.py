@@ -557,6 +557,9 @@ def evaluate_f1(model, crit, ds, args, device, use_amp, amp_dtype, rank,
         seed_min_dist=args.decode_seed_min_dist,
         score_thresh=args.decode_score_thresh,
         iou_thresh=args.decode_nms_iou,
+        max_seeds=args.decode_max_seeds,
+        nms_max_lanes=args.decode_nms_max_lanes,
+        nms_scale=args.decode_nms_scale,
     )
 
     tp = fp = fn = 0
@@ -705,6 +708,12 @@ def main():
     ap.add_argument("--decode-seed-min-dist", type=int, default=2)
     ap.add_argument("--decode-score-thresh", type=float, default=0.10)
     ap.add_argument("--decode-nms-iou", type=float, default=0.5)
+    ap.add_argument("--decode-max-seeds", type=int, default=1024,
+                    help="cap relay-chain seeds per image before decoding")
+    ap.add_argument("--decode-nms-max-lanes", type=int, default=128,
+                    help="keep top-scoring candidates before lane IoU NMS")
+    ap.add_argument("--decode-nms-scale", type=float, default=0.25,
+                    help="downscale factor for cached lane-NMS masks")
     ap.add_argument("--log-every", type=int, default=50)
     args = ap.parse_args()
 
@@ -846,7 +855,6 @@ def main():
         base_model,
         device_ids=[local_rank] if device.type == "cuda" else None,
         output_device=local_rank if device.type == "cuda" else None,
-        gradient_as_bucket_view=True,
         static_graph=True,
     ) if distributed else base_model
     model.train()
