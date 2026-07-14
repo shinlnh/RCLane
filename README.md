@@ -23,6 +23,10 @@ for curved lanes, Y-shapes and near-horizontal lanes.
   validation loss and parallel CULane-style F1 validation.
 - `eval_checkpoints.py` - rank one checkpoint or a checkpoint glob by lane-IoU
   F1, writing results after every model.
+- `export_onnx.py` - export a checkpoint to ONNX with a dynamic batch dimension
+  and stable names for all five prediction maps.
+- `test_video_onnx.py` - run ONNX Runtime inference on a video and render lane
+  identities plus per-stage runtime statistics.
 - `hf_train_carla.sh` - launch the optimized dual-GPU CARLA workflow on HF Jobs.
 
 **Dataset loaders**
@@ -142,6 +146,33 @@ python eval_checkpoints.py --data-root <CARLA_ROOT> \
 ```
 
 Add `--with-loss` when validation loss is also required.
+
+## ONNX inference
+
+Export a checkpoint and verify its outputs with ONNX Runtime:
+
+```bash
+python export_onnx.py --checkpoint checkpoints/rclane_b0_e19.pth \
+    --output exports/rclane_b0_e19.onnx --check-runtime
+```
+
+For CUDA inference, use the CUDA 13 ONNX Runtime build pinned in
+`requirements.txt`. Disable TF32 when exact lane decisions matter:
+
+```python
+import onnxruntime as ort
+
+session = ort.InferenceSession(
+    "exports/rclane_b0_e19.onnx",
+    providers=[
+        ("CUDAExecutionProvider", {"device_id": "0", "use_tf32": "0"}),
+        "CPUExecutionProvider",
+    ],
+)
+```
+
+The exported `seg_map` contains logits. Apply softmax over the channel dimension
+and pass foreground channel 1 to the relay-chain decoder.
 
 ## Credits
 

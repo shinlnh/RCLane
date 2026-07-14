@@ -1,7 +1,12 @@
 --extra-index-url https://download.pytorch.org/whl/cu130
+--extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-13-nightly/pypi/simple/
 
 # GPU build for NVIDIA CUDA. Driver 610.62 / RTX 5060 works with this wheel.
 numpy>=1.26,<2.0
 opencv-python>=4.8,<5.0
 shapely>=2.0,<3.0
+onnx>=1.16,<2.0
+# CUDA 13 build verified with torch 2.13.0+cu130. Do not install the CPU
+# `onnxruntime` package alongside this package; both expose the same module.
+onnxruntime-gpu==1.27.0.dev20260511001
 torch==2.13.0+cu130
