@@ -19,6 +19,10 @@ original MindSpore code ([lpplbiubiubiub/RCLane](https://github.com/lpplbiubiubi
   `--dataset {carla,culane,curvelanes}`, importing each loader lazily.
 - `eval_checkpoints.py` -- rank one checkpoint or a glob of checkpoints with the
   lane-IoU F1 metric; writes results after every model.
+- `export_onnx.py` -- export a checkpoint to ONNX with a dynamic batch dimension
+  and stable names for all five prediction maps.
+- `test_video_onnx.py` -- run ONNX Runtime inference on a video and render lane
+  identities plus per-stage runtime statistics.
 
 **Datasets (one file each, added per branch / merged into `dev`)**
 - `dataset_carla.py` -- CARLA LaneATT JSONL (the primary target).
@@ -78,5 +82,28 @@ python eval_checkpoints.py --data-root data/dataset \
     --checkpoints 'job_artifacts/<job-id>/carla-b0/*.pth' \
     --output eval_results/town04_clear_sunset.json \
     --eval-batch 16 --eval-workers 1 --eval-decode-workers 9
+
+# Export a checkpoint and verify its outputs with ONNX Runtime
+python export_onnx.py --checkpoint checkpoints/rclane_b0_e19.pth \
+    --output exports/rclane_b0_e19.onnx --check-runtime
 ```
+
+For CUDA inference, use the CUDA 13 ONNX Runtime build pinned in
+`requirements.txt`. Disable TF32 when exact lane decisions matter:
+
+```python
+import onnxruntime as ort
+
+session = ort.InferenceSession(
+    "exports/rclane_b0_e19.onnx",
+    providers=[
+        ("CUDAExecutionProvider", {"device_id": "0", "use_tf32": "0"}),
+        "CPUExecutionProvider",
+    ],
+)
+```
+
+The exported `seg_map` contains logits. Apply softmax over channel dimension and
+pass foreground channel 1 to the relay-chain decoder.
+
 > Needs `torch`; `encode.py`/datasets also need `shapely` + `opencv-python`.

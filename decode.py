@@ -36,6 +36,7 @@ class Lane:
         self.height = height
         self.points = []  # list of (x, y, score)
         self._score_sum = 0.0
+        self.lane_id = None  # stable left-to-right index, set by order_lanes()
 
     def append(self, x, y, score):
         self.points.append((float(x), float(y), float(score)))
@@ -243,12 +244,107 @@ def iou_nms(lines, thr=0.5, max_lanes=128, scale=0.25,
 
 
 # --------------------------------------------------------------------------- #
+#  lane identity (left-to-right ordering)
+# --------------------------------------------------------------------------- #
+def _bottom_x(lane):
+    """x where a lane meets its nearest row (largest y). Lanes fan out near the
+    camera, so this is the most reliable place to order them left-to-right."""
+    xy = lane.xy()
+    if len(xy) == 0:
+        return float("inf")
+    return float(xy[int(np.argmax(xy[:, 1])), 0])
+
+
+def order_lanes(lanes):
+    """Sort lanes left-to-right and tag each with a stable `lane_id` (0 = leftmost).
+
+    RCLane is anchor-free: `decode` emits lane instances in score order with no
+    inherent identity -- lane 0 today could be the middle lane on the next frame.
+    Ordering by the x at the bottom of the image (nearest the camera) imposes the
+    usual left-to-right numbering so `lanes[i].lane_id == i` is consistent across
+    frames. Returns a new list; also sets `.lane_id` on each Lane in place.
+    """
+    ordered = sorted(lanes, key=_bottom_x)
+    for i, ln in enumerate(ordered):
+        ln.lane_id = i
+    return ordered
+
+
+def select_ego_lanes(lanes, max_lanes=4, ego_x=None,
+                      min_score_ratio=0.5, balance_sides=True):
+    """Keep the closest reliable lane boundaries around the ego vehicle.
+
+    The decoder can occasionally return an extra low-confidence crawl in
+    addition to the real road boundaries.  When more than ``max_lanes`` are
+    present, first prefer candidates whose score is at least
+    ``min_score_ratio`` of the best candidate (provided that still leaves enough
+    lanes), then select the nearest boundaries using their near-camera x.
+
+    For the usual four-lane output, ``balance_sides`` reserves two slots on
+    either side of the camera centre when possible.  Any unfilled slots are
+    taken from the remaining closest candidates.  The returned lanes are
+    re-numbered from left to right.
+    """
+    if max_lanes is None:
+        return order_lanes(lanes)
+    if max_lanes <= 0:
+        raise ValueError("max_lanes must be positive or None")
+    if not 0.0 <= min_score_ratio <= 1.0:
+        raise ValueError("min_score_ratio must be in [0, 1]")
+
+    ordered = order_lanes(lanes)
+    if len(ordered) <= max_lanes:
+        return ordered
+
+    if ego_x is None:
+        ego_x = ordered[0].width / 2.0
+    ego_x = float(ego_x)
+
+    best_score = max(lane.score for lane in ordered)
+    reliable = [
+        lane for lane in ordered
+        if lane.score >= best_score * min_score_ratio
+    ]
+    # Never let the reliability gate force the output below the requested cap.
+    pool = reliable if len(reliable) >= max_lanes else ordered
+
+    def proximity_key(lane):
+        return (abs(_bottom_x(lane) - ego_x), -lane.score)
+
+    ranked = sorted(pool, key=proximity_key)
+    selected = []
+    if balance_sides and max_lanes >= 2:
+        left = sorted(
+            (lane for lane in pool if _bottom_x(lane) < ego_x),
+            key=proximity_key,
+        )
+        right = sorted(
+            (lane for lane in pool if _bottom_x(lane) >= ego_x),
+            key=proximity_key,
+        )
+        left_slots = max_lanes // 2
+        right_slots = max_lanes - left_slots
+        selected.extend(left[:left_slots])
+        selected.extend(right[:right_slots])
+
+    for lane in ranked:
+        if lane not in selected:
+            selected.append(lane)
+        if len(selected) == max_lanes:
+            break
+
+    return order_lanes(selected[:max_lanes])
+
+
+# --------------------------------------------------------------------------- #
 #  full decode
 # --------------------------------------------------------------------------- #
 def decode(seg_prob, up_arrow, down_arrow, up_bound, down_bound,
            step_length=10, seg_threshold=0.5, seed_min_dist=2,
            score_thresh=0.10, iou_thresh=0.5, seed_threshold=None,
-           max_seeds=1024, nms_max_lanes=128, nms_scale=0.25):
+           max_seeds=1024, nms_max_lanes=128, nms_scale=0.25,
+           sort_lanes=True, max_output_lanes=4, ego_x=None,
+           ego_min_score_ratio=0.5, balance_ego_sides=True):
     """
     Args:
         seg_prob: (H, W) foreground probability.
@@ -257,6 +353,8 @@ def decode(seg_prob, up_arrow, down_arrow, up_bound, down_bound,
         seed_threshold: threshold for picking seeds (defaults to seg_threshold).
             RCLane seg maps are low-magnitude (OHEM 15:1), so seeds often sit below
             0.5 -- set this lower (e.g. 0.3) for under-trained models.
+        max_output_lanes: final ego-centric lane cap. Defaults to four; pass
+            ``None`` to preserve every lane surviving NMS.
     Returns:
         list of Lane. Use `lane.xy()` for the (N, 2) point array and `lane.score`.
     """
@@ -278,6 +376,16 @@ def decode(seg_prob, up_arrow, down_arrow, up_bound, down_bound,
     lines = thresh_line(lines, score_thresh)
     lines = iou_nms(lines, iou_thresh, max_lanes=nms_max_lanes,
                     scale=nms_scale)
+    if max_output_lanes is not None:
+        lines = select_ego_lanes(
+            lines,
+            max_lanes=max_output_lanes,
+            ego_x=ego_x,
+            min_score_ratio=ego_min_score_ratio,
+            balance_sides=balance_ego_sides,
+        )
+    elif sort_lanes:
+        lines = order_lanes(lines)
     return lines
 
 
@@ -362,3 +470,20 @@ if __name__ == "__main__":
         "spatial preselection changed greedy NMS score priority"
     )
     print("OK -- diverse NMS preselection retains spatially distinct lanes.")
+
+    # Regression: cap the final output around the ego vehicle without keeping a
+    # weak extra crawl merely because its endpoint is slightly closer laterally.
+    ego_candidates = [
+        vertical_lane(8, 0.93),
+        vertical_lane(20, 0.24),  # spurious fifth crawl
+        vertical_lane(95, 0.94),
+        vertical_lane(748, 0.89),
+        vertical_lane(796, 0.81),
+    ]
+    ego_lanes = select_ego_lanes(ego_candidates, max_lanes=4)
+    ego_xs = [int(_bottom_x(lane)) for lane in ego_lanes]
+    assert ego_xs == [8, 95, 748, 796], (
+        f"ego selector kept the wrong lanes: {ego_xs}"
+    )
+    assert [lane.lane_id for lane in ego_lanes] == [0, 1, 2, 3]
+    print("OK -- ego post-processing keeps four reliable nearby lanes.")
