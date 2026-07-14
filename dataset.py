@@ -94,10 +94,27 @@ class LaneEncodeDataset(Dataset):
         if self.cache_dir:
             cp = self._cache_path(key)
             if os.path.exists(cp):
-                return dense_from_sparse(np.load(cp), self.H, self.W)
+                try:
+                    with np.load(cp) as sparse:
+                        return dense_from_sparse(sparse, self.H, self.W)
+                except (OSError, ValueError, EOFError):
+                    # A job killed during an older, non-atomic cache write may
+                    # leave a truncated npz. Rebuild it instead of killing a
+                    # long multi-GPU run.
+                    pass
         gt = encode(self._scale(lanes_orig, ow, oh), img_size=(self.H, self.W))
         if self.cache_dir:
-            np.savez(self._cache_path(key), **sparse_from_dense(gt))
+            # Many DataLoader/DDP processes can discover the same missing key
+            # at once (DistributedSampler may pad one sample). Write privately
+            # and atomically publish the completed archive so readers never see
+            # a half-written npz.
+            tmp = f"{cp}.{os.getpid()}.tmp.npz"
+            try:
+                np.savez(tmp, **sparse_from_dense(gt))
+                os.replace(tmp, cp)
+            finally:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
         return gt
 
     def __getitem__(self, idx):

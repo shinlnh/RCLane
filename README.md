@@ -19,8 +19,11 @@ for curved lanes, Y-shapes and near-horizontal lanes.
 - `encode.py` - lane polylines to RCLane supervision maps.
 - `decode.py` - relay-chain outputs back to lane polylines.
 - `dataset.py` - shared lane dataset base with resize, normalization and GT cache.
-- `train.py` - CUDA/AMP training loop, dataset selector, checkpoint resume,
-  validation loss and CULane-style F1 validation.
+- `train.py` - CUDA/AMP/DDP training loop, dataset selector, checkpoint resume,
+  validation loss and parallel CULane-style F1 validation.
+- `eval_checkpoints.py` - rank one checkpoint or a checkpoint glob by lane-IoU
+  F1, writing results after every model.
+- `hf_train_carla.sh` - launch the optimized dual-GPU CARLA workflow on HF Jobs.
 
 **Dataset loaders**
 - `dataset_carla.py` - CARLA LaneATT JSONL.
@@ -90,6 +93,17 @@ python train.py --dataset curvelanes --data-root <CURVELANES_ROOT> \
     --train-list train/train.txt --device cuda
 ```
 
+For two GPUs, launch one DDP process per GPU. Worker counts are per process:
+
+```bash
+torchrun --standalone --nproc_per_node=2 train.py \
+    --dataset carla --data-root <CARLA_ROOT> \
+    --label label_train.json --eval-list label_val.json --eval-f1 \
+    --vision b0 --epochs 20 --batch 64 --workers 21 --warm-cache \
+    --eval-batch 64 --eval-workers 2 --eval-decode-workers 18 \
+    --device cuda --amp --amp-dtype bfloat16
+```
+
 ## Checkpoints
 
 `train.py` saves full resumable checkpoints containing the model, optimizer,
@@ -117,6 +131,17 @@ paper:
 The current validation path computes CULane-style lane-level precision, recall
 and F1 by decoding predicted lanes, rasterizing lanes with the CULane line width
 convention, matching by IoU, and reporting the final F1 score.
+
+Rank a set of CARLA checkpoints without recomputing dense GT loss maps:
+
+```bash
+python eval_checkpoints.py --data-root <CARLA_ROOT> \
+    --eval-list label_val.json \
+    --checkpoints 'checkpoints/*.pth' \
+    --output eval_results/checkpoint_eval.json
+```
+
+Add `--with-loss` when validation loss is also required.
 
 ## Credits
 
