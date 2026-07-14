@@ -17,6 +17,10 @@ original MindSpore code ([lpplbiubiubiub/RCLane](https://github.com/lpplbiubiubi
   GT cache). A concrete dataset only implements `_load`.
 - `train.py` -- training loop (AdamW, lr 6e-4, poly LR). Selects the dataset via
   `--dataset {carla,culane,curvelanes}`, importing each loader lazily.
+- `eval_checkpoints.py` -- rank one checkpoint or a glob of checkpoints with the
+  lane-IoU F1 metric; writes results after every model.
+- `export_onnx.py` -- export a checkpoint to ONNX with a dynamic batch dimension
+  and stable names for all five prediction maps.
 
 **Datasets (one file each, added per branch / merged into `dev`)**
 - `dataset_carla.py` -- CARLA LaneATT JSONL (the primary target).
@@ -50,8 +54,6 @@ under-trained model, or train longer / on GPU with a pretrained MiT for sharper 
 
 ## Not done yet
 - Data augmentation (currently resize + normalize only).
-- Evaluation / F1 metric.
-- Full-scale training (needs a GPU; CPU is ~8.5s/2-img batch).
 
 ## Run
 ```bash
@@ -71,5 +73,35 @@ python train.py --dataset culane --data-root <CULANE_ROOT> \
 # CurveLanes
 python train.py --dataset curvelanes --data-root <CURVELANES_ROOT> \
     --train-list train/train.txt --vision b0 --epochs 20 --batch 32 --device cuda
+
+# Rank CARLA checkpoints by F1 (add --with-loss only when validation loss is needed)
+python eval_checkpoints.py --data-root data/dataset \
+    --eval-list ../rawimages/Town04_Opt/clear_sunset/label_raw_train.json \
+    --checkpoints 'job_artifacts/<job-id>/carla-b0/*.pth' \
+    --output eval_results/town04_clear_sunset.json \
+    --eval-batch 16 --eval-workers 1 --eval-decode-workers 9
+
+# Export a checkpoint and verify its outputs with ONNX Runtime
+python export_onnx.py --checkpoint checkpoints/rclane_b0_e19.pth \
+    --output exports/rclane_b0_e19.onnx --check-runtime
 ```
+
+For CUDA inference, use the CUDA 13 ONNX Runtime build pinned in
+`requirements.txt`. Disable TF32 when exact lane decisions matter:
+
+```python
+import onnxruntime as ort
+
+session = ort.InferenceSession(
+    "exports/rclane_b0_e19.onnx",
+    providers=[
+        ("CUDAExecutionProvider", {"device_id": "0", "use_tf32": "0"}),
+        "CPUExecutionProvider",
+    ],
+)
+```
+
+The exported `seg_map` contains logits. Apply softmax over channel dimension and
+pass foreground channel 1 to the relay-chain decoder.
+
 > Needs `torch`; `encode.py`/datasets also need `shapely` + `opencv-python`.

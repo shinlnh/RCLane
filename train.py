@@ -443,6 +443,22 @@ class _F1EvalDataset(Dataset):
         return x, _target_from_gt(gt), (lanes, ow, oh)
 
 
+class _F1PredictionDataset(Dataset):
+    """F1-only view: image + original lanes, without expensive GT encoding."""
+
+    def __init__(self, ds):
+        self.ds = ds
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __getitem__(self, idx):
+        img_bgr, lanes_orig, ow, oh, _key = self.ds._load(idx)
+        x = normalize_image(img_bgr, self.ds.W, self.ds.H)
+        lanes = [np.asarray(l, dtype=np.float32) for l in lanes_orig]
+        return x, (lanes, ow, oh)
+
+
 class _CacheWarmDataset(Dataset):
     """Compute only GT cache entries, one sample per DataLoader task."""
 
@@ -487,10 +503,11 @@ def warm_cache(ds, args, device, rank, world_size, name):
     loader = DataLoader(**kwargs)
     t0 = time.time()
     created = seen = 0
+    progress_every = min(2000, max(100, len(loader) // 10))
     for batch in loader:
         created += int(batch.sum().item())
         seen += len(batch)
-        if rank == 0 and seen % 2000 == 0:
+        if rank == 0 and (seen % progress_every == 0 or seen == len(loader)):
             print(f"  warm {name}: {seen}/{len(loader)} local samples")
     totals = torch.tensor([created, seen], dtype=torch.float64, device=device)
     if _dist_ready():
@@ -507,6 +524,12 @@ def _f1_collate(batch):
     targets = {k: torch.stack([b[1][k] for b in batch], 0) for k in keys}
     metas = [b[2] for b in batch]
     return imgs, targets, metas
+
+
+def _f1_prediction_collate(batch):
+    imgs = torch.stack([b[0] for b in batch], 0)
+    metas = [b[1] for b in batch]
+    return imgs, metas
 
 
 def _f1_decode_match(payload):
@@ -534,7 +557,8 @@ def evaluate_f1(model, crit, ds, args, device, use_amp, amp_dtype, rank,
     n_samples = 0
     t0 = time.time()
 
-    eval_ds = _F1EvalDataset(ds)
+    skip_loss = getattr(args, "eval_skip_loss", False)
+    eval_ds = _F1PredictionDataset(ds) if skip_loss else _F1EvalDataset(ds)
     load_workers = args.eval_workers if args.eval_workers is not None else args.workers
     sampler = DistributedEvalSampler(eval_ds, world_size, rank) \
         if world_size > 1 else None
@@ -543,7 +567,7 @@ def evaluate_f1(model, crit, ds, args, device, use_amp, amp_dtype, rank,
         shuffle=False,
         sampler=sampler,
         num_workers=load_workers,
-        collate_fn=_f1_collate,
+        collate_fn=_f1_prediction_collate if skip_loss else _f1_collate,
         pin_memory=(device.type == "cuda"),
         worker_init_fn=_worker_init,
     )
@@ -584,18 +608,26 @@ def evaluate_f1(model, crit, ds, args, device, use_amp, amp_dtype, rank,
         initargs=(0,),
     ) if n_proc > 1 else nullcontext(None)
     with pool_ctx as executor, torch.no_grad():
-        for imgs, targets, metas in loader:
+        for batch_idx, batch in enumerate(loader, 1):
+            if skip_loss:
+                imgs, metas = batch
+                targets = None
+            else:
+                imgs, targets, metas = batch
             batch_size = imgs.shape[0]
             imgs = imgs.to(device, non_blocking=True)
-            tgt = {k: v.to(device, non_blocking=True) for k, v in targets.items()}
+            tgt = None if skip_loss else {
+                k: v.to(device, non_blocking=True) for k, v in targets.items()
+            }
             amp_ctx = torch.amp.autocast(
                 "cuda", enabled=use_amp, dtype=amp_dtype
             ) if use_amp else nullcontext()
             with amp_ctx:
                 preds = model(imgs)
-                out = crit(preds, tgt)
-            for k, v in out.items():
-                running[k] = running.get(k, 0.0) + v.item() * batch_size
+                out = None if skip_loss else crit(preds, tgt)
+            if out is not None:
+                for k, v in out.items():
+                    running[k] = running.get(k, 0.0) + v.item() * batch_size
             n_samples += batch_size
 
             seg = torch.softmax(preds["seg_map"], dim=1)[:, 1].float().cpu().numpy()
@@ -614,10 +646,23 @@ def evaluate_f1(model, crit, ds, args, device, use_amp, amp_dtype, rank,
                     pending.append(executor.submit(_f1_decode_match, payload))
                     if len(pending) >= max_pending:
                         collect(pending.popleft().result())
+            log_every = getattr(args, "eval_log_every", 0)
+            if rank == 0 and log_every and (
+                    batch_idx % log_every == 0 or n_samples == len(eval_ds)):
+                print(f"  eval: {int(n_samples)}/{len(eval_ds)} samples "
+                      f"in {time.time() - t0:.1f}s")
         while pending:
             collect(pending.popleft().result())
 
-    running, n_samples = _reduce_sums(running, n_samples, device)
+    if skip_loss:
+        if _dist_ready():
+            sample_count = torch.tensor(
+                float(n_samples), dtype=torch.float64, device=device
+            )
+            dist.all_reduce(sample_count, op=dist.ReduceOp.SUM)
+            n_samples = sample_count.item()
+    else:
+        running, n_samples = _reduce_sums(running, n_samples, device)
     counts = torch.tensor([tp, fp, fn], dtype=torch.float64, device=device)
     if _dist_ready():
         dist.all_reduce(counts, op=dist.ReduceOp.SUM)
@@ -629,7 +674,9 @@ def evaluate_f1(model, crit, ds, args, device, use_amp, amp_dtype, rank,
     recall = tp / denom_r if denom_r else 0.0
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
     n_samples = max(1.0, n_samples)
-    metrics = {f"val_{k}": running[k] / n_samples for k in _LOSS_KEYS}
+    metrics = {} if skip_loss else {
+        f"val_{k}": running[k] / n_samples for k in _LOSS_KEYS
+    }
     metrics.update({
         "val_precision": precision,
         "val_recall": recall,
@@ -711,7 +758,7 @@ def main():
     ap.add_argument("--decode-max-seeds", type=int, default=1024,
                     help="cap relay-chain seeds per image before decoding")
     ap.add_argument("--decode-nms-max-lanes", type=int, default=128,
-                    help="keep top-scoring candidates before lane IoU NMS")
+                    help="cap spatially diverse candidates before lane IoU NMS")
     ap.add_argument("--decode-nms-scale", type=float, default=0.25,
                     help="downscale factor for cached lane-NMS masks")
     ap.add_argument("--log-every", type=int, default=50)
