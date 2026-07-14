@@ -1,0 +1,7 @@
+--extra-index-url https://download.pytorch.org/whl/cu130
+
+# GPU build for NVIDIA CUDA. Driver 610.62 / RTX 5060 works with this wheel.
+numpy>=1.26,<2.0
+opencv-python>=4.8,<5.0
+shapely>=2.0,<3.0
+torch==2.13.0+cu130

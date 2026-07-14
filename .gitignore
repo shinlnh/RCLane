@@ -7,6 +7,12 @@ data/
 # generated GT cache
 gt_cache*/
 
+# local evaluation / remote-job artifacts
+eval_results/
+job_logs/
+job_artifacts/
+runs/
+
 # checkpoints / weights
 checkpoints/
 *.pth

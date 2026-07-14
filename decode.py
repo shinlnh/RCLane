@@ -35,9 +35,11 @@ class Lane:
         self.width = width
         self.height = height
         self.points = []  # list of (x, y, score)
+        self._score_sum = 0.0
 
     def append(self, x, y, score):
         self.points.append((float(x), float(y), float(score)))
+        self._score_sum += float(score)
 
     def reverse(self):
         self.points.reverse()
@@ -49,11 +51,12 @@ class Lane:
     def score(self):
         if not self.points:
             return 0.0
-        return float(np.mean([p[2] for p in self.points]))
+        return self._score_sum / len(self.points)
 
     def concat(self, other):
         out = Lane(self.width, self.height)
         out.points = self.points + other.points
+        out._score_sum = self._score_sum + other._score_sum
         return out
 
     def xy(self):
@@ -79,7 +82,7 @@ class Lane:
 # --------------------------------------------------------------------------- #
 #  seeding
 # --------------------------------------------------------------------------- #
-def point_nms(prob, thr=0.5, min_dist=2):
+def point_nms(prob, thr=0.5, min_dist=2, max_seeds=1024):
     """Greedy point-NMS: keep highest-prob foreground pixels >= min_dist apart."""
     H, W = prob.shape
     ys, xs = np.where(prob > thr)
@@ -95,6 +98,8 @@ def point_nms(prob, thr=0.5, min_dist=2):
             continue
         seeds.append((x, y))
         taken[max(0, y - r):y + r + 1, max(0, x - r):x + r + 1] = True
+        if max_seeds is not None and len(seeds) >= max_seeds:
+            break
     return seeds
 
 
@@ -105,12 +110,15 @@ def decode_branch(cx, cy, semantic_fine, arrow, bound, step_length, seg_threshol
     H, W = semantic_fine.shape
     arrow_dx, arrow_dy = arrow[0], arrow[1]
     lane = Lane(W, H)
-    remain_steps = []
+    remain_sq_sum = 0.0
+    remain_count = 0
     cx, cy = int(cx), int(cy)
 
     for index in range(H):
         if semantic_fine[cy, cx] > seg_threshold:
-            remain_steps.append(bound[cy, cx] * 100 / step_length + index)
+            remain = bound[cy, cx] * 100 / step_length + index
+            remain_sq_sum += remain * remain
+            remain_count += 1
 
         dx = arrow_dx[cy, cx]
         dy = arrow_dy[cy, cx]
@@ -124,8 +132,8 @@ def decode_branch(cx, cy, semantic_fine, arrow, bound, step_length, seg_threshol
 
         lane.append(cx, cy, semantic_fine[cy, cx])
 
-        if remain_steps:
-            ret = np.sqrt(np.mean([r ** 2 for r in remain_steps]))
+        if remain_count:
+            ret = np.sqrt(remain_sq_sum / remain_count)
         else:
             ret = 1
         if semantic_fine[cy, cx] > seg_threshold:
@@ -142,10 +150,82 @@ def thresh_line(lines, thr=0.10):
     return [ln for ln in lines if ln.score >= thr]
 
 
-def iou_nms(lines, thr=0.5):
+def _diverse_preselect(order, max_lanes, bin_px=16):
+    """Cap the candidate list while keeping spatial diversity.
+
+    `order` is already sorted by score (desc). Taking the top `max_lanes`
+    outright lets the single strongest lane monopolize every slot -- its copies
+    all score highest -- so genuine but slightly weaker lanes get dropped before
+    IoU-NMS ever compares them (this collapsed multi-lane curves to one lane).
+    Instead, bucket candidates by their horizontal position on the lower half of
+    the line (where lanes are well separated) and pick round-robin across
+    buckets, so every lane keeps representatives within the cap.
+    """
+    if max_lanes is None:
+        return order
+    if max_lanes <= 0:
+        raise ValueError("max_lanes must be positive or None")
+    if bin_px <= 0:
+        raise ValueError("bin_px must be positive")
+    if len(order) <= max_lanes:
+        return order
+    buckets = {}
+    for ln in order:                      # already score-sorted
+        xy = ln.xy()
+        if len(xy) == 0:
+            continue
+        low = xy[xy[:, 1] >= np.median(xy[:, 1])]      # lower (near) half
+        ref = low if len(low) else xy
+        key = int(np.median(ref[:, 0]) // bin_px)
+        buckets.setdefault(key, []).append(ln)
+    keys = list(buckets.keys())
+    idx = {k: 0 for k in keys}
+    selected = []
+    while len(selected) < max_lanes:
+        progressed = False
+        for k in keys:
+            if idx[k] < len(buckets[k]):
+                selected.append(buckets[k][idx[k]])
+                idx[k] += 1
+                progressed = True
+                if len(selected) >= max_lanes:
+                    break
+        if not progressed:
+            break
+    # NMS is greedy, so restore global score priority after choosing a spatially
+    # diverse candidate set.
+    return sorted(selected, key=lambda ln: ln.score, reverse=True)
+
+
+def iou_nms(lines, thr=0.5, max_lanes=128, scale=0.25,
+            lane_width=15):
+    """Lane IoU NMS with one cached, downscaled mask per candidate.
+
+    Rasterizes each candidate once (downscaled) instead of re-rasterizing both
+    masks per pair. The candidate list is capped with `_diverse_preselect` rather
+    than a plain top-score cut, so the strongest lane cannot crowd out the others
+    before NMS runs.
+    """
     if not lines:
         return []
     order = sorted(lines, key=lambda ln: ln.score, reverse=True)
+    order = _diverse_preselect(order, max_lanes)
+    height = max(1, int(round(order[0].height * scale)))
+    width = max(1, int(round(order[0].width * scale)))
+    scaled_width = max(1, int(round(lane_width * scale)))
+    masks = []
+    areas = []
+    for line in order:
+        mask = np.zeros((height, width), np.uint8)
+        points = line.xy() * scale
+        if len(points) >= 2:
+            points[:, 0] = np.clip(points[:, 0], 0, width - 1)
+            points[:, 1] = np.clip(points[:, 1], 0, height - 1)
+            cv2.polylines(mask, [points.astype(np.int32)], False, 1,
+                          scaled_width)
+        masks.append(mask)
+        areas.append(int(np.count_nonzero(mask)))
+
     suppressed = [False] * len(order)
     keep = []
     for i in range(len(order)):
@@ -153,7 +233,11 @@ def iou_nms(lines, thr=0.5):
             continue
         keep.append(order[i])
         for j in range(i + 1, len(order)):
-            if not suppressed[j] and order[i].iou(order[j]) >= thr:
+            if suppressed[j]:
+                continue
+            inter = int(np.count_nonzero(masks[i] & masks[j]))
+            union = areas[i] + areas[j] - inter
+            if union > 0 and inter / union >= thr:
                 suppressed[j] = True
     return keep
 
@@ -163,7 +247,8 @@ def iou_nms(lines, thr=0.5):
 # --------------------------------------------------------------------------- #
 def decode(seg_prob, up_arrow, down_arrow, up_bound, down_bound,
            step_length=10, seg_threshold=0.5, seed_min_dist=2,
-           score_thresh=0.10, iou_thresh=0.5, seed_threshold=None):
+           score_thresh=0.10, iou_thresh=0.5, seed_threshold=None,
+           max_seeds=1024, nms_max_lanes=128, nms_scale=0.25):
     """
     Args:
         seg_prob: (H, W) foreground probability.
@@ -178,7 +263,7 @@ def decode(seg_prob, up_arrow, down_arrow, up_bound, down_bound,
     H, W = seg_prob.shape
     if seed_threshold is None:
         seed_threshold = seg_threshold
-    seeds = point_nms(seg_prob, seed_threshold, seed_min_dist)
+    seeds = point_nms(seg_prob, seed_threshold, seed_min_dist, max_seeds)
     ub0, db0 = up_bound[0], down_bound[0]  # bound channel 0 (both channels equal)
 
     lines = []
@@ -191,7 +276,8 @@ def decode(seg_prob, up_arrow, down_arrow, up_bound, down_bound,
             lines.append(full)
 
     lines = thresh_line(lines, score_thresh)
-    lines = iou_nms(lines, iou_thresh)
+    lines = iou_nms(lines, iou_thresh, max_lanes=nms_max_lanes,
+                    scale=nms_scale)
     return lines
 
 
@@ -249,3 +335,30 @@ if __name__ == "__main__":
     assert errs.mean() < 8.0, "reconstructed lane strays too far from GT!"
 
     print("OK -- encode/decode round trip reconstructs the lane.")
+
+    # Regression: a high-scoring lane may have hundreds of near-duplicate
+    # crawls. The cap must still retain weaker candidates from other lanes,
+    # while greedy NMS must receive candidates in descending score order.
+    def vertical_lane(x, score):
+        lane = Lane(W, H)
+        lane.append(x, 200, score)
+        lane.append(x, 300, score)
+        return lane
+
+    candidates = [
+        vertical_lane(100 + index % 2, 0.99 - index * 0.001)
+        for index in range(24)
+    ]
+    candidates += [vertical_lane(350, 0.90), vertical_lane(650, 0.89)]
+    candidates.sort(key=lambda lane: lane.score, reverse=True)
+    selected = _diverse_preselect(candidates, max_lanes=8, bin_px=16)
+    selected_bins = {
+        int(np.median(lane.xy()[:, 0]) // 16) for lane in selected
+    }
+    expected_bins = {100 // 16, 350 // 16, 650 // 16}
+    assert expected_bins <= selected_bins, "spatial preselection dropped a lane"
+    selected_scores = [lane.score for lane in selected]
+    assert selected_scores == sorted(selected_scores, reverse=True), (
+        "spatial preselection changed greedy NMS score priority"
+    )
+    print("OK -- diverse NMS preselection retains spatially distinct lanes.")
