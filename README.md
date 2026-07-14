@@ -17,6 +17,8 @@ original MindSpore code ([lpplbiubiubiub/RCLane](https://github.com/lpplbiubiubi
   GT cache). A concrete dataset only implements `_load`.
 - `train.py` -- training loop (AdamW, lr 6e-4, poly LR). Selects the dataset via
   `--dataset {carla,culane,curvelanes}`, importing each loader lazily.
+- `eval_checkpoints.py` -- rank one checkpoint or a glob of checkpoints with the
+  lane-IoU F1 metric; writes results after every model.
 
 **Datasets (one file each, added per branch / merged into `dev`)**
 - `dataset_carla.py` -- CARLA LaneATT JSONL (the primary target).
@@ -50,8 +52,6 @@ under-trained model, or train longer / on GPU with a pretrained MiT for sharper 
 
 ## Not done yet
 - Data augmentation (currently resize + normalize only).
-- Evaluation / F1 metric.
-- Full-scale training (needs a GPU; CPU is ~8.5s/2-img batch).
 
 ## Run
 ```bash
@@ -71,5 +71,12 @@ python train.py --dataset culane --data-root <CULANE_ROOT> \
 # CurveLanes
 python train.py --dataset curvelanes --data-root <CURVELANES_ROOT> \
     --train-list train/train.txt --vision b0 --epochs 20 --batch 32 --device cuda
+
+# Rank CARLA checkpoints by F1 (add --with-loss only when validation loss is needed)
+python eval_checkpoints.py --data-root data/dataset \
+    --eval-list ../rawimages/Town04_Opt/clear_sunset/label_raw_train.json \
+    --checkpoints 'job_artifacts/<job-id>/carla-b0/*.pth' \
+    --output eval_results/town04_clear_sunset.json \
+    --eval-batch 16 --eval-workers 1 --eval-decode-workers 9
 ```
 > Needs `torch`; `encode.py`/datasets also need `shapely` + `opencv-python`.
