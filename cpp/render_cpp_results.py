@@ -61,6 +61,10 @@ def load_bev_result(payload):
         "role": payload["role"],
         "score": float(payload["score"]),
         "valid_fit": fit is not None,
+        "parallel_repair_applied": bool(
+            payload.get("parallel_repaired", False)
+        ),
+        "synthetic_bev_lane": bool(payload.get("synthetic", False)),
     }
     if fit_payload is not None:
         record["rmse_m"] = float(fit_payload["rmse"])
@@ -72,11 +76,21 @@ def load_bev_result(payload):
     }
 
 
-def funnel_report(bev_payloads):
+def funnel_report(frame_payload, bev_payloads):
+    topology = frame_payload.get("bev_topology", {})
+    mode = frame_payload.get("bev_mode", topology.get("mode", "raw"))
     return {
-        "mode": "raw_model_projection",
-        "parallel_assumption": False,
-        "synthetic_lanes": False,
+        "mode": mode,
+        "parallel_assumption": bool(
+            topology.get("parallel_assumption", mode != "raw")
+        ),
+        "synthetic_lanes": any(
+            item.get("synthetic", False) for item in bev_payloads
+        ),
+        "parallel_repair_applied": bool(topology.get("applied", False)),
+        "parallel_repair_forced": bool(topology.get("forced", False)),
+        "parallel_reference_lane": topology.get("reference_lane"),
+        "trigger_pairs": topology.get("trigger_pairs", []),
         "clipped_lanes": [
             f"P{item['lane_id']}" for item in bev_payloads
             if item["funnel_clipped"]
@@ -128,7 +142,7 @@ def main():
                 lane_results = [
                     load_bev_result(item) for item in bev_payloads
                 ]
-                guard = funnel_report(bev_payloads)
+                guard = funnel_report(payload, bev_payloads)
                 timing = payload["timing"]
                 rolling_core_ms.append(float(timing["core_ms"]))
                 rolling_fps = 1000.0 / max(

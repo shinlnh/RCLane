@@ -347,8 +347,22 @@ def draw_bev(lane_results, bev_range, calibration, funnel_report=None,
         (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.54,
         (255, 255, 255), 2, cv2.LINE_AA,
     )
+    report = funnel_report or {}
+    mode = report.get("mode", "raw")
+    if mode == "complete-four":
+        mode_label = "BEV COMPLETE-FOUR | synthetic P0-P3 allowed"
+    elif mode == "always-parallel":
+        mode_label = "BEV ALWAYS-PARALLEL | detected lanes only"
+    elif mode == "trigger":
+        mode_label = (
+            "BEV TRIGGER-REPAIRED"
+            if report.get("parallel_repair_applied", False)
+            else "BEV TRIGGER | raw topology healthy"
+        )
+    else:
+        mode_label = "RAW MODEL LANES | no synthetic/parallel prior"
     cv2.putText(
-        canvas, "RAW MODEL LANES | no synthetic/parallel prior",
+        canvas, mode_label,
         (20, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
         (80, 220, 255), 1, cv2.LINE_AA,
     )

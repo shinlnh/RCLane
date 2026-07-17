@@ -65,3 +65,21 @@ get_filename_component(CUDART_LIBRARY_DIR "${CUDART_LIBRARY}" DIRECTORY)
 set_target_properties(rclane_runtime PROPERTIES
     BUILD_RPATH "${TENSORRT_LIBRARY_DIR};${CUDART_LIBRARY_DIR}"
 )
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(rclane_bev_modes_test
+        tests/bev_modes_test.cpp
+        src/bev.cpp
+        src/decoder.cpp
+    )
+    target_include_directories(rclane_bev_modes_test PRIVATE
+        include
+        "${TENSORRT_INCLUDE_DIR}"
+    )
+    target_link_libraries(rclane_bev_modes_test PRIVATE OpenMP::OpenMP_CXX)
+    target_compile_options(rclane_bev_modes_test PRIVATE
+        -O2 -Wall -Wextra -Wpedantic
+    )
+    add_test(NAME bev_modes COMMAND rclane_bev_modes_test)
+endif()

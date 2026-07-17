@@ -5,9 +5,23 @@ preprocessing, TensorRT inference, 1024-seed decode and raw-model BEV export
 before the next frame begins. There is no inter-frame overlap. Rendering,
 source-video decoding and video writing are outside the measured core latency.
 
-The BEV output is a one-to-one projection of decoded model lanes. It does not
-force curves to be parallel and does not synthesize missing lanes. The funnel
-guard may only shorten a cubic's valid X domain; it never changes coefficients.
+Raw BEV remains the default and is a one-to-one projection of decoded model
+lanes. Optional BEV-only topology modes can detect collapsed/crossing curves,
+force detected curves to be parallel, or synthesize a complete P0-P3 set. The
+decoded camera-space lanes are never modified or back-projected.
+
+Select a mode with `--bev-mode`:
+
+- `raw`: measured cubics only; funnel clipping may shorten their X domain.
+- `trigger`: repair only when an adjacent gap collapses or crosses.
+- `always-parallel`: force all valid detected cubics to share one parallel
+  reference geometry; missing lanes remain missing.
+- `complete-four`: always export parallel P0-P3, synthesizing missing markings;
+  this display/output prior intentionally bypasses camera-funnel clipping.
+
+Python-compatible aliases are also accepted: `--disable-parallel-repair`,
+`--parallel-repair`, `--always-parallel-repair`, and
+`--complete-four-parallel-lanes`.
 
 The build intentionally consumes TensorRT/CUDA SDK headers and shared libraries
 from the target machine; serialized TensorRT engines must be rebuilt per GPU.
@@ -39,6 +53,9 @@ cpp/build/rclane_runtime \
   --bev-json /tmp/cpp_bev.json \
   --threads 8
 ```
+
+For example, enable trigger-only repair with `--bev-mode trigger`, or always
+complete four parallel BEV markings with `--bev-mode complete-four`.
 
 ## Sequential full-video benchmark
 

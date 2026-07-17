@@ -34,10 +34,23 @@ struct Arguments {
     int warmup{10};
     int iterations{100};
     int threads{8};
+    rclane::BevConfig bev_config;
+    bool bev_mode_explicit{false};
 };
 
 Arguments parse_arguments(int argc, char** argv) {
     Arguments args;
+    const auto select_bev_mode = [&args](
+        rclane::BevMode mode, const std::string& option
+    ) {
+        if (args.bev_mode_explicit && args.bev_config.mode != mode) {
+            throw std::invalid_argument(
+                "conflicting BEV mode option: " + option
+            );
+        }
+        args.bev_config.mode = mode;
+        args.bev_mode_explicit = true;
+    };
     for (int index = 1; index < argc; ++index) {
         const std::string option = argv[index];
         const auto value = [&]() -> std::string {
@@ -78,6 +91,28 @@ Arguments parse_arguments(int argc, char** argv) {
             args.iterations = std::stoi(value());
         } else if (option == "--threads") {
             args.threads = std::stoi(value());
+        } else if (option == "--bev-mode") {
+            select_bev_mode(rclane::parse_bev_mode(value()), option);
+        } else if (option == "--disable-parallel-repair") {
+            select_bev_mode(rclane::BevMode::Raw, option);
+        } else if (option == "--parallel-repair") {
+            select_bev_mode(rclane::BevMode::Trigger, option);
+        } else if (option == "--always-parallel-repair") {
+            select_bev_mode(rclane::BevMode::AlwaysParallel, option);
+        } else if (option == "--complete-four-parallel-lanes") {
+            select_bev_mode(rclane::BevMode::CompleteFour, option);
+        } else if (option == "--nominal-lane-width") {
+            args.bev_config.nominal_lane_width = std::stod(value());
+        } else if (option == "--repair-trigger-gap-ratio") {
+            args.bev_config.trigger_gap_ratio = std::stod(value());
+        } else if (option == "--repair-minimum-gap") {
+            args.bev_config.minimum_gap = std::stod(value());
+        } else if (option == "--repair-minimum-run") {
+            args.bev_config.minimum_bad_run = std::stod(value());
+        } else if (option == "--repair-max-reference-extrapolation") {
+            args.bev_config.maximum_reference_extrapolation = std::stod(value());
+        } else if (option == "--funnel-margin") {
+            args.bev_config.funnel_margin = std::stod(value());
         } else {
             throw std::invalid_argument("unknown argument: " + option);
         }
@@ -87,11 +122,19 @@ Arguments parse_arguments(int argc, char** argv) {
         + static_cast<int>(args.raw_bgr_stdin);
     if (args.engine.empty() || input_modes != 1
         || args.source_width <= 0 || args.source_height <= 0
-        || args.timing_warmup < 0 || args.max_frames < 0) {
+        || args.timing_warmup < 0 || args.max_frames < 0
+        || args.bev_config.nominal_lane_width <= 0.0
+        || args.bev_config.trigger_gap_ratio <= 0.0
+        || args.bev_config.trigger_gap_ratio >= 1.0
+        || args.bev_config.minimum_gap <= 0.0
+        || args.bev_config.minimum_bad_run < 0.0
+        || args.bev_config.maximum_reference_extrapolation < 0.0
+        || args.bev_config.funnel_margin < 0.0) {
         throw std::invalid_argument(
             "usage: rclane_runtime --engine model.engine "
             "(--input-nchw frame.f32 | --input-bgr frame.bgr | "
             "--raw-bgr-stdin) "
+            "[--bev-mode raw|trigger|always-parallel|complete-four] "
             "[--dump-prefix output]"
         );
     }
@@ -223,7 +266,8 @@ void write_stream_report(
     const TimingSummary& decode,
     const TimingSummary& bev,
     const TimingSummary& core,
-    double mean_lanes
+    double mean_lanes,
+    const rclane::BevConfig& bev_config
 ) {
     if (path.empty()) {
         return;
@@ -247,9 +291,14 @@ void write_stream_report(
            << "  \"frame_overlap\": false,\n"
            << "  \"rendering_included\": false,\n"
            << "  \"video_writing_included\": false,\n"
-           << "  \"bev_mode\": \"raw_model_projection\",\n"
-           << "  \"parallel_assumption\": false,\n"
-           << "  \"synthetic_lanes\": false,\n"
+           << "  \"bev_mode\": \""
+           << rclane::bev_mode_name(bev_config.mode) << "\",\n"
+           << "  \"parallel_assumption\": "
+           << (bev_config.mode == rclane::BevMode::Raw ? "false" : "true")
+           << ",\n"
+           << "  \"synthetic_lane_mode\": "
+           << (bev_config.mode == rclane::BevMode::CompleteFour
+               ? "true" : "false") << ",\n"
            << "  \"frames\": " << frames << ",\n"
            << "  \"timed_frames\": " << timed_frames << ",\n"
            << "  \"decode_threads\": " << threads << ",\n"
@@ -259,7 +308,7 @@ void write_stream_report(
     timing("preprocess", preprocess, true);
     timing("inference_with_transfers", inference, true);
     timing("decode", decode, true);
-    timing("bev_cubic_funnel", bev, true);
+    timing("bev_cubic_topology_funnel", bev, true);
     timing("core_pipeline", core, false);
     stream << "  },\n  \"fps_from_core_median_latency\": "
            << 1000.0 / core.median << "\n}\n";
@@ -331,7 +380,10 @@ int run_raw_stream(
             outputs, decoder_config, &decode_statistics
         );
         const auto decode_stop = std::chrono::steady_clock::now();
-        const auto bev_lanes = rclane::project_lanes_to_bev(lanes);
+        rclane::BevTopologyReport topology;
+        const auto bev_lanes = rclane::project_lanes_to_bev(
+            lanes, args.bev_config, &topology
+        );
         const auto bev_stop = std::chrono::steady_clock::now();
         const double frame_preprocess_ms = milliseconds(
             preprocess_start, preprocess_stop
@@ -351,6 +403,10 @@ int run_raw_stream(
                           << ",\"decode_ms\":" << frame_decode_ms
                           << ",\"bev_result_ms\":" << frame_bev_ms
                           << ",\"core_ms\":" << frame_core_ms << "}"
+                          << ",\"bev_mode\":\""
+                          << rclane::bev_mode_name(args.bev_config.mode)
+                          << "\",\"bev_topology\":"
+                          << rclane::bev_topology_json(topology)
                           << ",\"lanes\":[";
             for (std::size_t lane_index = 0; lane_index < lanes.size();
                  ++lane_index) {
@@ -387,6 +443,20 @@ int run_raw_stream(
                               << (lane.fit_accepted ? "true" : "false")
                               << ",\"funnel_clipped\":"
                               << (lane.funnel_clipped ? "true" : "false")
+                              << ",\"synthetic\":"
+                              << (lane.synthetic ? "true" : "false")
+                              << ",\"parallel_repaired\":"
+                              << (lane.parallel_repaired ? "true" : "false")
+                              << ",\"parallel_reference_lane\":";
+                if (lane.parallel_reference_lane < 0) {
+                    frame_results << "null";
+                } else {
+                    frame_results << lane.parallel_reference_lane;
+                }
+                frame_results << ",\"parallel_offset_m\":"
+                              << lane.parallel_offset_m
+                              << ",\"parallel_repair_method\":\""
+                              << lane.parallel_repair_method << "\""
                               << ",\"points\":[";
                 for (std::size_t point_index = 0;
                      point_index < lane.points.size(); ++point_index) {
@@ -418,7 +488,7 @@ int run_raw_stream(
             }
             frame_results << "]}\n";
         }
-        lane_sum += static_cast<double>(lanes.size());
+        lane_sum += static_cast<double>(bev_lanes.size());
         if (static_cast<int>(frames) >= args.timing_warmup) {
             read_samples.push_back(milliseconds(read_start, read_stop));
             preprocess_samples.push_back(frame_preprocess_ms);
@@ -444,10 +514,13 @@ int run_raw_stream(
     const auto core = summarize(std::move(core_samples));
     write_stream_report(
         args.report, frames, timed_frames, args.threads, read, preprocess,
-        inference, decode, bev, core, lane_sum / static_cast<double>(frames)
+        inference, decode, bev, core, lane_sum / static_cast<double>(frames),
+        args.bev_config
     );
     std::cout << std::fixed << std::setprecision(3)
-              << "C++ sequential raw-BEV benchmark (render/write excluded)\n"
+              << "C++ sequential BEV benchmark mode="
+              << rclane::bev_mode_name(args.bev_config.mode)
+              << " (render/write excluded)\n"
               << "frames=" << frames << " timed=" << timed_frames
               << " threads=" << args.threads << '\n'
               << "preprocess median=" << preprocess.median << "ms\n"
@@ -491,9 +564,12 @@ int main(int argc, char** argv) {
                 args.lanes_json, lanes, &decode_statistics
             );
         }
-        const auto bev_lanes = rclane::project_lanes_to_bev(lanes);
+        rclane::BevTopologyReport topology;
+        const auto bev_lanes = rclane::project_lanes_to_bev(
+            lanes, args.bev_config, &topology
+        );
         if (!args.bev_json.empty()) {
-            rclane::write_bev_json(args.bev_json, bev_lanes);
+            rclane::write_bev_json(args.bev_json, bev_lanes, &topology);
         }
         const auto timing = runner.benchmark(
             input.data(), args.warmup, args.iterations
@@ -513,13 +589,16 @@ int main(int argc, char** argv) {
                   << " NMS=" << decode_statistics.nms_candidates
                   << "->" << decode_statistics.nms_survivors
                   << " output_lanes=" << lanes.size() << '\n';
-        std::cout << "BEV lanes=" << bev_lanes.size() << " valid_cubics="
+        std::cout << "BEV mode="
+                  << rclane::bev_mode_name(args.bev_config.mode)
+                  << " lanes=" << bev_lanes.size() << " valid_cubics="
                   << std::count_if(
                       bev_lanes.begin(), bev_lanes.end(),
                       [](const rclane::BevLane& lane) {
                           return lane.fit_accepted;
                       }
-                  ) << '\n';
+                  ) << " topology_applied="
+                  << (topology.applied ? "true" : "false") << '\n';
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "error: " << error.what() << '\n';
