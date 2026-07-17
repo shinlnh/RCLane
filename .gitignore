@@ -23,6 +23,7 @@ checkpoints/
 *.profile
 *.timing
 exports/
+cpp/build*/
 
 # local videos / visualization outputs
 *.mp4
