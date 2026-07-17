@@ -19,6 +19,14 @@ checkpoints/
 *.pt
 *.onnx
 *.ckpt
+*.engine
+*.profile
+*.timing
+exports/
+cpp/build*/
+
+# local videos / visualization outputs
+*.mp4
 
 # python
 __pycache__/

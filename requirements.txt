@@ -10,3 +10,6 @@ onnx>=1.16,<2.0
 # `onnxruntime` package alongside this package; both expose the same module.
 onnxruntime-gpu==1.27.0.dev20260511001
 torch==2.13.0+cu130
+# TensorRT 10 is required because ONNX Runtime's provider links libnvinfer.so.10.
+tensorrt-cu13==10.16.1.11
+numba>=0.61,<0.63

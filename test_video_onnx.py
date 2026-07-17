@@ -1,8 +1,8 @@
 """Run an RCLane ONNX model on a video and render predicted lanes + timing.
 
-The input video may already contain ground-truth annotations. Predictions are
-drawn as solid cyan polylines with a black outline so they remain distinguishable
-from colored GT points.
+The input video may already contain ground-truth annotations. Ego-lane boundaries
+are highlighted in green/orange, other predictions in cyan, all with a black
+outline so they remain distinguishable from colored GT points.
 """
 
 import argparse
@@ -16,8 +16,13 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 
-from dataset import normalize_image
-from decode import decode
+from dataset import normalize_image_numpy
+from decode import (
+    configure_decode_threads,
+    decode,
+    ego_lane_boundaries,
+    warmup_decode_backend,
+)
 
 
 MODEL_HEIGHT = 320
@@ -32,77 +37,183 @@ OUTPUT_NAMES = (
 
 
 def softmax_foreground(logits):
-    shifted = logits - np.max(logits, axis=1, keepdims=True)
-    exp_logits = np.exp(shifted)
-    return exp_logits[:, 1] / np.sum(exp_logits, axis=1)
+    # Binary softmax: exp(l1)/(exp(l0)+exp(l1)) = sigmoid(l1-l0).
+    # This halves exponent work and avoids allocating a two-channel temporary.
+    difference = logits[:, 0] - logits[:, 1]
+    with np.errstate(over="ignore"):
+        return 1.0 / (1.0 + np.exp(difference))
 
 
-def create_session(model_path, provider, allow_tf32):
+def create_session(model_path, provider, allow_tf32, trt_cache_dir=None):
     available = ort.get_available_providers()
-    if provider == "cuda":
+    cuda_options = {
+        "device_id": "0",
+        "use_tf32": "1" if allow_tf32 else "0",
+        "cudnn_conv_algo_search": "HEURISTIC",
+        "cudnn_conv_use_max_workspace": "1",
+        "do_copy_in_default_stream": "1",
+    }
+    if provider == "tensorrt":
+        if "TensorrtExecutionProvider" not in available:
+            raise RuntimeError(
+                "TensorrtExecutionProvider is unavailable in ONNX Runtime"
+            )
+        try:
+            import tensorrt  # noqa: F401 - preloads libnvinfer for ORT
+        except ImportError as exc:
+            raise RuntimeError(
+                "TensorRT provider requested but tensorrt-cu13 is not installed"
+            ) from exc
+        cache_dir = Path(
+            trt_cache_dir or Path(model_path).resolve().parent / "trt_cache"
+        )
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        shape = f"images:1x3x{MODEL_HEIGHT}x{MODEL_WIDTH}"
+        providers = [
+            (
+                "TensorrtExecutionProvider",
+                {
+                    "device_id": "0",
+                    "trt_fp16_enable": "True",
+                    "trt_engine_cache_enable": "True",
+                    "trt_engine_cache_path": str(cache_dir),
+                    "trt_timing_cache_enable": "True",
+                    "trt_timing_cache_path": str(cache_dir),
+                    "trt_force_timing_cache": "True",
+                    "trt_builder_optimization_level": "3",
+                    "trt_max_workspace_size": str(2 * 1024 ** 3),
+                    "trt_min_subgraph_size": "1",
+                    "trt_profile_min_shapes": shape,
+                    "trt_profile_opt_shapes": shape,
+                    "trt_profile_max_shapes": shape,
+                },
+            ),
+            ("CUDAExecutionProvider", cuda_options),
+            "CPUExecutionProvider",
+        ]
+    elif provider == "cuda":
         if "CUDAExecutionProvider" not in available:
             raise RuntimeError(
                 "CUDAExecutionProvider is unavailable; install the CUDA 13 "
                 "onnxruntime-gpu build from requirements.txt"
             )
         providers = [
-            (
-                "CUDAExecutionProvider",
-                {
-                    "device_id": "0",
-                    "use_tf32": "1" if allow_tf32 else "0",
-                    "cudnn_conv_algo_search": "HEURISTIC",
-                    "cudnn_conv_use_max_workspace": "1",
-                    "do_copy_in_default_stream": "1",
-                },
-            ),
+            ("CUDAExecutionProvider", cuda_options),
             "CPUExecutionProvider",
         ]
     else:
         providers = ["CPUExecutionProvider"]
 
     session = ort.InferenceSession(str(model_path), providers=providers)
-    if provider == "cuda" and session.get_providers()[0] != "CUDAExecutionProvider":
+    expected_provider = {
+        "cuda": "CUDAExecutionProvider",
+        "tensorrt": "TensorrtExecutionProvider",
+    }.get(provider)
+    if expected_provider and session.get_providers()[0] != expected_provider:
         raise RuntimeError(
-            f"CUDA provider was requested but session uses {session.get_providers()}"
+            f"{expected_provider} was requested but session uses "
+            f"{session.get_providers()}"
         )
     return session
 
 
+def _lane_points_in_frame(lane, width, height):
+    points = lane.xy().copy()
+    if len(points) < 2:
+        return np.empty((0, 2), dtype=np.float32)
+    points[:, 0] *= width / MODEL_WIDTH
+    points[:, 1] *= height / MODEL_HEIGHT
+    points[:, 0] = np.clip(points[:, 0], 0, width - 1)
+    points[:, 1] = np.clip(points[:, 1], 0, height - 1)
+    return points
+
+
+def _x_at_rows(points, rows):
+    order = np.argsort(points[:, 1])
+    ys = points[order, 1]
+    xs = points[order, 0]
+    unique_y, inverse = np.unique(ys, return_inverse=True)
+    x_sum = np.zeros(len(unique_y), dtype=np.float64)
+    count = np.zeros(len(unique_y), dtype=np.float64)
+    np.add.at(x_sum, inverse, xs)
+    np.add.at(count, inverse, 1)
+    return np.interp(rows, unique_y, x_sum / count)
+
+
+def draw_ego_corridor(frame, ego_left, ego_right):
+    """Shade the visible region bounded by the two current-lane boundaries."""
+    if ego_left is None or ego_right is None:
+        return
+    height, width = frame.shape[:2]
+    left = _lane_points_in_frame(ego_left, width, height)
+    right = _lane_points_in_frame(ego_right, width, height)
+    if len(left) < 2 or len(right) < 2:
+        return
+    y_start = max(float(left[:, 1].min()), float(right[:, 1].min()))
+    y_stop = min(float(left[:, 1].max()), float(right[:, 1].max()))
+    if y_stop - y_start < 8:
+        return
+    rows = np.linspace(y_start, y_stop, 64)
+    left_x = _x_at_rows(left, rows)
+    right_x = _x_at_rows(right, rows)
+    valid = right_x > left_x
+    if np.count_nonzero(valid) < 2:
+        return
+    rows = rows[valid]
+    left_edge = np.column_stack((left_x[valid], rows))
+    right_edge = np.column_stack((right_x[valid], rows))[::-1]
+    polygon = np.round(np.vstack((left_edge, right_edge))).astype(np.int32)
+    overlay = frame.copy()
+    cv2.fillPoly(overlay, [polygon], (40, 140, 40), cv2.LINE_AA)
+    cv2.addWeighted(overlay, 0.18, frame, 0.82, 0, frame)
+
+
 def draw_predictions(frame, lanes):
     height, width = frame.shape[:2]
-    sx = width / MODEL_WIDTH
-    sy = height / MODEL_HEIGHT
+    ego_left, ego_right = ego_lane_boundaries(lanes)
+    draw_ego_corridor(frame, ego_left, ego_right)
+
     for index, lane in enumerate(lanes):
-        points = lane.xy().copy()
+        points = _lane_points_in_frame(lane, width, height)
         if len(points) < 2:
             continue
-        points[:, 0] *= sx
-        points[:, 1] *= sy
-        points[:, 0] = np.clip(points[:, 0], 0, width - 1)
-        points[:, 1] = np.clip(points[:, 1], 0, height - 1)
         points = np.round(points).astype(np.int32)
-        cv2.polylines(frame, [points], False, (0, 0, 0), 10, cv2.LINE_AA)
-        cv2.polylines(frame, [points], False, (255, 255, 0), 5, cv2.LINE_AA)
+        role = getattr(lane, "lane_role", None)
+        if role == "ego_left":
+            color, role_text, thickness = (0, 255, 0), "EGO-L", 7
+        elif role == "ego_right":
+            color, role_text, thickness = (0, 165, 255), "EGO-R", 7
+        else:
+            color, role_text, thickness = (255, 255, 0), "", 5
+        cv2.polylines(
+            frame, [points], False, (0, 0, 0), thickness + 5, cv2.LINE_AA
+        )
+        cv2.polylines(frame, [points], False, color, thickness, cv2.LINE_AA)
 
         near = points[int(np.argmax(points[:, 1]))]
         lane_id = lane.lane_id if lane.lane_id is not None else index
-        label = f"P{lane_id} {lane.score:.2f}"
-        position = (int(near[0]) + 8, max(32, int(near[1]) - 8))
+        role_label = f" {role_text}" if role_text else ""
+        label = f"P{lane_id}{role_label} {lane.score:.2f}"
+        text_size = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2
+        )[0]
+        label_x = min(max(8, int(near[0]) + 8), width - text_size[0] - 8)
+        position = (label_x, max(32, int(near[1]) - 8))
         cv2.putText(
             frame, label, position, cv2.FONT_HERSHEY_SIMPLEX,
             0.65, (0, 0, 0), 5, cv2.LINE_AA,
         )
         cv2.putText(
             frame, label, position, cv2.FONT_HERSHEY_SIMPLEX,
-            0.65, (255, 255, 0), 2, cv2.LINE_AA,
+            0.65, color, 2, cv2.LINE_AA,
         )
 
 
 def draw_runtime(frame, provider, lane_count, infer_ms, decode_ms, pipeline_ms,
-                 rolling_pipeline_ms, source_fps, input_has_gt):
+                 rolling_pipeline_ms, source_fps, input_has_gt, ego_left,
+                 ego_right):
     height, width = frame.shape[:2]
-    box_width, box_height = min(690, width - 20), 160
+    box_width, box_height = min(690, width - 20), 196
     left, top = width - box_width - 10, 10
     overlay = frame.copy()
     cv2.rectangle(
@@ -113,8 +224,11 @@ def draw_runtime(frame, provider, lane_count, infer_ms, decode_ms, pipeline_ms,
     model_fps = 1000.0 / max(infer_ms, 1e-9)
     pipeline_fps = 1000.0 / max(rolling_pipeline_ms, 1e-9)
     realtime = "YES" if pipeline_fps >= source_fps else "NO"
+    left_id = f"P{ego_left.lane_id}" if ego_left is not None else "missing"
+    right_id = f"P{ego_right.lane_id}" if ego_right is not None else "missing"
     lines = (
         f"RCLane e19 ONNX {provider.upper()} | lanes={lane_count}",
+        f"ego lane boundaries: {left_id} (L) | {right_id} (R)",
         f"infer {infer_ms:6.1f} ms ({model_fps:5.1f} FPS)",
         f"decode {decode_ms:6.1f} ms | pipeline {pipeline_ms:6.1f} ms",
         f"rolling pipeline {pipeline_fps:5.1f} FPS | realtime@{source_fps:g}: {realtime}",
@@ -126,9 +240,10 @@ def draw_runtime(frame, provider, lane_count, infer_ms, decode_ms, pipeline_ms,
             2, cv2.LINE_AA,
         )
 
+    prediction_legend = "EGO-L: green | EGO-R: orange | other: cyan"
     legend = (
-        "GT: colored dots | Prediction: cyan solid lines"
-        if input_has_gt else "Prediction: cyan solid lines"
+        f"GT: colored dots | {prediction_legend}"
+        if input_has_gt else prediction_legend
     )
     cv2.putText(
         frame, legend, (16, height - 20), cv2.FONT_HERSHEY_SIMPLEX,
@@ -158,7 +273,11 @@ def parse_args():
     parser.add_argument("--output", default="runs/video_test.mp4")
     parser.add_argument("--summary", default=None,
                         help="timing JSON; defaults next to output video")
-    parser.add_argument("--provider", choices=["cuda", "cpu"], default="cuda")
+    parser.add_argument(
+        "--provider", choices=["tensorrt", "cuda", "cpu"],
+        default="tensorrt",
+    )
+    parser.add_argument("--trt-cache-dir", default="exports/trt_cache")
     parser.add_argument("--allow-tf32", action="store_true",
                         help="faster CUDA math with slightly larger numerical drift")
     parser.add_argument("--input-has-gt", action="store_true",
@@ -177,6 +296,11 @@ def parse_args():
         "--max-ego-lanes", type=int, default=4,
         help="post-process to at most N reliable lanes nearest the ego vehicle",
     )
+    parser.add_argument(
+        "--decode-crawl-backend", choices=("auto", "numba", "numpy"),
+        default="auto",
+    )
+    parser.add_argument("--decode-cpu-threads", type=int, default=8)
     return parser.parse_args()
 
 
@@ -204,7 +328,12 @@ def main():
         output_path.stem + ".tmp" + output_path.suffix
     )
 
-    session = create_session(model_path, args.provider, args.allow_tf32)
+    cv2.setNumThreads(1)
+    configure_decode_threads(args.decode_cpu_threads)
+    session = create_session(
+        model_path, args.provider, args.allow_tf32, args.trt_cache_dir
+    )
+    warmup_decode_backend(args.decode_crawl_backend)
     warmup = np.zeros((1, 3, MODEL_HEIGHT, MODEL_WIDTH), dtype=np.float32)
     for _ in range(5):
         session.run(list(OUTPUT_NAMES), {"images": warmup})
@@ -228,6 +357,9 @@ def main():
 
     timings = {"preprocess": [], "inference": [], "decode": [], "pipeline": []}
     lane_counts = []
+    ego_left_frames = 0
+    ego_right_frames = 0
+    ego_pair_frames = 0
     rolling = deque(maxlen=30)
     started = time.perf_counter()
     frame_index = 0
@@ -239,8 +371,7 @@ def main():
             pipeline_start = time.perf_counter()
 
             stage = time.perf_counter()
-            images = normalize_image(frame, MODEL_WIDTH, MODEL_HEIGHT)
-            images = images.unsqueeze(0).numpy()
+            images = normalize_image_numpy(frame, MODEL_WIDTH, MODEL_HEIGHT)
             preprocess_ms = (time.perf_counter() - stage) * 1000
 
             stage = time.perf_counter()
@@ -266,6 +397,7 @@ def main():
                 nms_max_lanes=args.decode_nms_max_lanes,
                 nms_scale=args.decode_nms_scale,
                 max_output_lanes=args.max_ego_lanes,
+                crawl_backend=args.decode_crawl_backend,
             )
             decode_ms = (time.perf_counter() - stage) * 1000
             pipeline_ms = (time.perf_counter() - pipeline_start) * 1000
@@ -276,12 +408,16 @@ def main():
             timings["pipeline"].append(pipeline_ms)
             lane_counts.append(len(lanes))
             rolling.append(pipeline_ms)
+            ego_left, ego_right = ego_lane_boundaries(lanes)
+            ego_left_frames += int(ego_left is not None)
+            ego_right_frames += int(ego_right is not None)
+            ego_pair_frames += int(ego_left is not None and ego_right is not None)
 
             draw_predictions(frame, lanes)
             draw_runtime(
                 frame, args.provider, len(lanes), inference_ms, decode_ms,
                 pipeline_ms, float(np.median(rolling)), source_fps,
-                args.input_has_gt,
+                args.input_has_gt, ego_left, ego_right,
             )
             writer.write(frame)
             frame_index += 1
@@ -313,6 +449,12 @@ def main():
             "max_ego_lanes": args.max_ego_lanes,
             "min_score_ratio": 0.5,
             "balance_sides": True,
+            "lane_id_semantics": {
+                "P0": "next boundary left of ego lane",
+                "P1": "ego lane left boundary",
+                "P2": "ego lane right boundary",
+                "P3": "next boundary right of ego lane",
+            },
         },
         "resolution": [width, height],
         "source_fps": source_fps,
@@ -325,6 +467,12 @@ def main():
             "mean": float(np.mean(lane_counts)),
             "min": int(min(lane_counts)),
             "max": int(max(lane_counts)),
+        },
+        "ego_lane_boundary_coverage": {
+            "left_frames": ego_left_frames,
+            "right_frames": ego_right_frames,
+            "pair_frames": ego_pair_frames,
+            "pair_rate": ego_pair_frames / frame_index,
         },
     }
     temporary_summary = summary_path.with_suffix(summary_path.suffix + ".tmp")
