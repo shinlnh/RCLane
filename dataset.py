@@ -33,6 +33,23 @@ def normalize_image(img_bgr, W, H):
     return torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1)))
 
 
+def normalize_image_numpy(img_bgr, W, H):
+    """Fast inference-only BGR uint8 -> normalized ``(1, 3, H, W)`` NumPy.
+
+    ``cv2.dnn.blobFromImage`` performs resize, RGB channel swap and NCHW
+    packing in compiled code. The result is numerically equivalent to
+    :func:`normalize_image` within float32 rounding, while avoiding the
+    temporary HWC float image and Torch tensor wrapper.
+    """
+    images = cv2.dnn.blobFromImage(
+        img_bgr, scalefactor=1.0 / 255.0, size=(W, H), mean=(0, 0, 0),
+        swapRB=True, crop=False,
+    )
+    images[0] -= _MEAN.reshape(3, 1, 1)
+    images[0] /= _STD.reshape(3, 1, 1)
+    return images
+
+
 def sparse_from_dense(gt):
     """Keep only foreground pixels of the dense GT maps."""
     ys, xs = np.where(gt["seg_map"] > 0.5)

@@ -84,7 +84,31 @@ python eval_checkpoints.py --data-root data/dataset \
 # Export a checkpoint and verify its outputs with ONNX Runtime
 python export_onnx.py --checkpoint checkpoints/rclane_b0_e19.pth \
     --output exports/rclane_b0_e19.onnx --check-runtime
+
+# Build/cache a device-specific TensorRT FP16 engine and compare it to CUDA FP32
+python build_tensorrt_engine.py --model exports/rclane_b0_e19.onnx \
+    --cache-dir exports/trt_cache
+
+# Benchmark the sequential production core (preprocess + engine + 1024-seed
+# decode + raw-model BEV) without visualization/video-I/O
+python benchmark_realtime.py --model exports/rclane_b0_e19.onnx \
+    --video raw_Town04_Opt_20260714_093110.mp4 --provider tensorrt \
+    --trt-cache-dir exports/trt_cache --cpu-threads 8 --max-seeds 1024 \
+    --max-frames 300 --report runs/realtime_benchmark_1024seeds.json
+
+# Render raw decoded lanes in BEV and export one cubic per detected lane.
+# No lane is synthesized or forced parallel; cubics are clipped to camera FOV.
+python test_video_bev_onnx.py --model exports/rclane_b0_e19.onnx \
+    --video raw_Town04_Opt_20260714_093110.mp4 --provider tensorrt \
+    --trt-cache-dir exports/trt_cache --decode-cpu-threads 8 \
+    --decode-max-seeds 1024 --output runs/video_bev_e19.mp4
 ```
+
+TensorRT cache files are tied to the TensorRT version and GPU compute
+capability. Rebuild the cache on a different deployment GPU. The real-time
+benchmark deliberately reports camera/video acquisition and visualization
+separately: its core latency is the latency relevant to the ADAS algorithm,
+whereas rendering and MP4 encoding are offline diagnostics.
 
 For CUDA inference, use the CUDA 13 ONNX Runtime build pinned in
 `requirements.txt`. Disable TF32 when exact lane decisions matter:
